@@ -193,3 +193,82 @@ def test_rejects_nonsense_inputs():
         strike_from_delta(100.0, 1.0, 0.05, 0.2, 1.5, "call")
     with pytest.raises(ValueError):
         strike_from_delta(100.0, 1.0, 0.05, 0.2, 0.0, "call")
+
+
+# ------------------------------------------- implied vol inversion (real-IV measurement)
+
+
+@pytest.mark.parametrize("sigma", [0.08, 0.18, 0.35, 0.60, 1.20])
+@pytest.mark.parametrize("kind", ["call", "put"])
+@pytest.mark.parametrize("moneyness", [0.80, 0.95, 1.00, 1.05, 1.25])
+def test_implied_vol_round_trips_where_vol_is_identifiable(sigma, kind, moneyness):
+    """Price at a known vol, invert, recover it. The whole basis of measuring the VRP.
+
+    Where vol is *not* identifiable the function must decline rather than guess: a deep
+    in-the-money contract at low vol is worth its intrinsic value almost exactly, so vega
+    has collapsed and a one-cent price difference moves the implied vol by tens of points.
+    """
+    from canalyst.options.bs import MIN_TIME_VALUE_FRACTION, implied_vol, intrinsic
+
+    S, T, r, q = 160.0, 30 / 252, 0.042, 0.021
+    K = S * moneyness
+    price = bs_price(S, K, T, r, sigma, kind, q=q)
+    recovered = implied_vol(price, S, K, T, r, kind, q=q)
+
+    discounted = intrinsic(S * math.exp(-q * T), K * math.exp(-r * T), kind)
+    identifiable = (price - discounted) >= MIN_TIME_VALUE_FRACTION * S
+    if not identifiable:
+        assert recovered is None, "must decline when vega has collapsed"
+        return
+    assert recovered == pytest.approx(sigma, abs=1e-4)
+
+
+def test_implied_vol_declines_on_a_deep_itm_contract():
+    """The concrete case the guard exists for, named so it cannot silently regress."""
+    from canalyst.options.bs import implied_vol
+
+    S, K, T, r, q = 160.0, 128.0, 30 / 252, 0.042, 0.021
+    price = bs_price(S, K, T, r, 0.08, "call", q=q)
+    assert implied_vol(price, S, K, T, r, "call", q=q) is None
+    # The same strike at a vol high enough to carry real time value IS identifiable.
+    rich = bs_price(S, K, T, r, 0.55, "call", q=q)
+    assert implied_vol(rich, S, K, T, r, "call", q=q) == pytest.approx(0.55, abs=1e-4)
+
+
+def test_implied_vol_rejects_prices_below_intrinsic():
+    """Stale quotes and wide spreads produce these. A clamped value would enter a mean
+    as though it were a measurement, so None is the honest answer."""
+    from canalyst.options.bs import implied_vol
+
+    S, K, T, r = 160.0, 120.0, 30 / 252, 0.042
+    below = bs_price(S, K, T, r, 1e-9, "call") * 0.5
+    assert implied_vol(below, S, K, T, r, "call") is None
+
+
+def test_implied_vol_rejects_prices_above_the_underlying():
+    from canalyst.options.bs import implied_vol
+    assert implied_vol(200.0, 160.0, 150.0, 30 / 252, 0.042, "call") is None
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_implied_vol_rejects_nonsense_prices(bad):
+    from canalyst.options.bs import implied_vol
+    assert implied_vol(bad, 160.0, 165.0, 30 / 252, 0.042, "call") is None
+
+
+def test_implied_vol_returns_none_at_expiry():
+    from canalyst.options.bs import implied_vol
+    assert implied_vol(5.0, 160.0, 155.0, 0.0, 0.042, "call") is None
+
+
+def test_implied_vol_accounts_for_the_dividend_yield():
+    """Inverting with the wrong q returns the wrong vol, which would corrupt the measured
+    premium on exactly the dividend payers the batch is full of."""
+    from canalyst.options.bs import implied_vol
+
+    S, K, T, r, sigma, q = 160.0, 168.0, 30 / 252, 0.042, 0.22, 0.03
+    price = bs_price(S, K, T, r, sigma, "call", q=q)
+    assert implied_vol(price, S, K, T, r, "call", q=q) == pytest.approx(sigma, abs=1e-4)
+    ignoring_q = implied_vol(price, S, K, T, r, "call", q=0.0)
+    assert ignoring_q is not None
+    assert abs(ignoring_q - sigma) > 1e-3, "ignoring q must visibly bias the answer"

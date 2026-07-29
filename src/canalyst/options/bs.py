@@ -23,6 +23,9 @@ Kind = Literal["call", "put"]
 
 _MIN_SIGMA = 1e-12
 _MIN_T = 1e-12
+#: Minimum time value, as a fraction of spot, for volatility to be identifiable from a
+#: price. Below this, vega has collapsed and the inversion is ill-conditioned.
+MIN_TIME_VALUE_FRACTION = 1e-4
 
 
 def _validate(S: float, K: float, kind: str) -> None:
@@ -98,6 +101,66 @@ def bs_delta(
     if kind == "call":
         return discount * cdf(d1)
     return -discount * cdf(-d1)
+
+
+def implied_vol(
+    price: float,
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    kind: Kind,
+    q: float = 0.0,
+    tol: float = 1e-8,
+    max_iter: int = 200,
+) -> float | None:
+    """Invert Black-Scholes for volatility. Returns None when no solution exists.
+
+    This is what turns a real traded option price into a measurable implied volatility,
+    and therefore what lets the variance risk premium be measured instead of assumed.
+
+    Bisection rather than Newton. Newton is faster but vega collapses toward zero for
+    deep out-of-the-money and near-expiry contracts, which is exactly the population being
+    inverted here, and a vanishing derivative makes Newton diverge silently. Bisection
+    cannot diverge; it either brackets a root or reports that none exists.
+
+    Returns None rather than raising, and rather than clamping to a bound, for prices that
+    violate no-arbitrage (below intrinsic, or above the maximum an option can be worth).
+    Those occur in real data from stale quotes and wide spreads, and a clamped 0.001 or
+    5.0 would enter a mean as if it were a measurement.
+    """
+    _validate(S, K, kind)
+    if T <= _MIN_T or price is None or price <= 0 or not math.isfinite(price):
+        return None
+
+    lower_bound = intrinsic(S * math.exp(-q * T), K * math.exp(-r * T), kind)
+    upper_bound = S * math.exp(-q * T) if kind == "call" else K * math.exp(-r * T)
+    if price < lower_bound - tol or price > upper_bound + tol:
+        return None  # outside no-arbitrage bounds
+
+    # Refuse when there is no volatility information in the price. A deep in-the-money
+    # contract is worth its intrinsic value almost exactly, vega collapses, and the
+    # inversion becomes ill-conditioned: a one-cent price difference moves the answer by
+    # tens of vol points. Returning a number there implies precision that does not exist,
+    # and since these prices are being averaged into a measured variance risk premium, one
+    # garbage inversion contaminates the estimate. Absence of a measurement is the truth.
+    time_value = price - lower_bound
+    if time_value < MIN_TIME_VALUE_FRACTION * S:
+        return None
+
+    lo, hi = 1e-6, 5.0
+    if bs_price(S, K, T, r, hi, kind, q=q) < price:
+        return None  # not attainable even at 500% vol
+
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        if bs_price(S, K, T, r, mid, kind, q=q) < price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
 
 
 def strike_from_delta(

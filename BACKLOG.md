@@ -184,9 +184,55 @@ subset and used to calibrate the rest; and the strategies still to add are cash-
 put, bull call spread, long straddle, collar plus zero-cost collar, short strangle, iron
 condor, and the wheel.
 
-Real historical implied vol is reachable and confirmed working: Robinhood serves daily
-OHLC for expired contracts via `get_option_instruments(state='expired')` then
-`get_option_historicals`. `TSLA 240816C00250000` closed at 12.18 on 2024-07-19, an actual
-roll date. Inverting Black-Scholes on those prices gives measured IV, which turns the
-markup from an invented knob into data. Budget roughly 60-120 calls per ticker across five
-years and cache aggressively.
+### Real historical implied vol: PARTIALLY RETRACTED, tested 2026-07-29
+
+An earlier note in this file claimed this source was "confirmed working" and would remove
+the project's central limitation. **That was based on a single TSLA sample and does not
+generalise.** Retracted, with the measurements.
+
+What is true: expired contracts are queryable (`get_option_instruments(state='expired')`)
+and `get_option_historicals` returns daily OHLC for them. `TSLA 240816C00250000` closed at
+12.18 on 2024-07-19, a real roll date, and inverts cleanly.
+
+What is false: that the data is generally usable. Sampled five WMT roll dates spanning
+2022-2025 at the 0.25-delta strike, inverted with `bs.implied_vol`:
+
+| roll | K(adj) | traded close | RV | implied vol | IV/RV | quality |
+|---|---|---|---|---|---|---|
+| 2022-05-20 | 43.33 | 0.217 | 35.0% | 28.6% | 0.82 | low 0.01, range 0.01-2.88 |
+| 2024-02-16 | 58.33 | 2.320 | 13.1% | 47.1% | **3.60** | both bars `interpolated=true` |
+| 2024-09-20 | 82.00 | 0.010 | 19.3% | 5.9% | **0.30** | 0.01 = min tick |
+| 2025-04-17 | 101.00 | 0.010 | 37.9% | 11.7% | **0.31** | 0.01 = min tick |
+| 2025-11-21 | 110.00 | 0.850 | 22.1% | 20.9% | 0.95 | real, range 0.78-2.03 |
+
+Ratios span 0.30 to 3.60, a factor of twelve. Three of five bars are `interpolated=true`
+(the API's own gap-fill flag, which its own guide says to ignore for analytics) and/or
+pinned at the $0.01 minimum tick, which means no trades occurred rather than a price of
+one cent. A 3.7%-OTM WMT call with 20 days at 19% realised vol is worth roughly $0.80.
+Only two observations are plausible, both **below** 1.0, which would imply IV under
+realised vol, the opposite of a variance risk premium. At n=2 with this noise that is not
+a finding either.
+
+TSLA sampled cleanly because its options are exceptionally liquid. Thin OTM contracts on
+ordinary large caps do not, and coverage degrades going back.
+
+**Where this leaves the VRP.** `bs.implied_vol` is built and tested (bisection, declines
+when vega has collapsed rather than guessing), so the *inverter* is not the problem, the
+*source* is. Options worth trying, in order: (a) filter hard on data quality, taking only
+non-interpolated bars above a few times the minimum tick, and accept far fewer
+observations with an honest confidence interval; (b) invert near-the-money contracts
+instead, which are liquid enough to price reliably, and accept that the measured VRP is
+then an ATM number applied to an OTM strike; (c) use a keyed vendor with real historical
+IV. Until one of those lands, the realised-vol basis stands and its understatement stays
+disclosed rather than silently corrected.
+
+**Two data traps found while testing this, both worth keeping:**
+- **A split creates a second option chain.** WMT split 3-for-1 on 2024-02-26. Contracts
+  expiring *before* it live under `chain_id fa2f0d5e...` with **as-traded** strikes (130.00),
+  while everything after lives under `69632d04...` with post-split strikes. Pre-split
+  prices must be divided by the split ratio to compare against a split-adjusted spot.
+- **`get_option_chains` only returns the active chain**, so the pre-split chain is
+  discoverable only through the expired-instruments endpoint. Nothing warns you.
+
+Budget if retried: roughly 60-120 calls per ticker across five years, cached aggressively,
+and expect to discard a large fraction of the bars.
