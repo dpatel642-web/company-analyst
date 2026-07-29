@@ -121,6 +121,7 @@ class CoveredCall:
                     sigma,
                     self.target_delta,
                     "call",
+                    q=ctx.div_yield,
                 ),
                 2,
             )

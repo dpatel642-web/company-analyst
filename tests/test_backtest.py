@@ -19,8 +19,12 @@ import pytest
 
 from canalyst.backtest import TRADING_DAYS, run_backtest
 from canalyst.data.calendar import roll_schedule, sessions
-from canalyst.options.bs import bs_price
-from canalyst.options.vol import apply_markup, close_to_close
+from canalyst.options.bs import bs_delta, bs_price, strike_from_delta
+from canalyst.options.vol import (
+    apply_markup,
+    close_to_close,
+    trailing_dividend_yield,
+)
 from canalyst.strategies.buy_hold import BuyHold
 from canalyst.strategies.covered_call import CoveredCall
 from canalyst.strategies.protective_put import ProtectivePut
@@ -488,6 +492,7 @@ def test_strategy_cannot_see_the_future():
         assert set(vars(ctx)) == {
             "date", "spot", "sigma", "rate", "dividend",
             "is_roll", "expiry", "years_to_expiry", "open_positions", "equity",
+            "div_yield",
         }
         if ctx.expiry is not None:
             assert ctx.expiry > ctx.date
@@ -514,6 +519,10 @@ def test_expiring_call_settles_at_intrinsic():
     result.assert_identity()
 
     strike = round(100.0 * 1.05, 2)
+    # q must match what the engine used. This test previously defaulted q to 0 and so
+    # pinned the wrong convention: fixing the engine would have broken it. No dividends
+    # here, so q is 0 for a real reason rather than by omission.
+    assert result.bars["dividends"].sum() == 0.0
     premium = bs_price(
         100.0,
         strike,
@@ -521,6 +530,7 @@ def test_expiring_call_settles_at_intrinsic():
         0.04,
         0.30,
         "call",
+        q=0.0,
     )
     settled = result.bars.loc[expiry_day]
     assert settled["open_positions"] == 0
@@ -620,3 +630,89 @@ def test_collateralised_and_uncollateralised_agree_before_any_assignment():
     pd.testing.assert_series_equal(
         on.value[upto], off.value[upto], check_names=False, rtol=0, atol=1e-9
     )
+
+
+# --------------------------------------- dividend yield reaches the pricer (BACKLOG #1)
+
+
+def _dividend_world(annual_yield: float = 0.024, **kw):
+    """A world with a real quarterly dividend, for exercising q."""
+    close, sigma, rates, schedule = _world(**kw)
+    dividends = pd.Series(0.0, index=close.index)
+    per_quarter = float(close.iloc[0]) * annual_yield / 4.0
+    for day in close.index[::63]:
+        dividends.loc[day] = per_quarter
+    return close, sigma, rates, schedule, dividends
+
+
+def test_dividend_yield_is_derived_when_not_supplied():
+    """Omitting q must not silently mean zero on a payer."""
+    close, sigma, rates, schedule, dividends = _dividend_world()
+    q = trailing_dividend_yield(dividends, close)
+    assert q.max() > 0.015, "a 2.4% payer should register a positive yield"
+    assert (q >= 0).all()
+
+
+def test_zero_dividend_gives_zero_yield():
+    close, sigma, rates, schedule = _world()
+    q = trailing_dividend_yield(pd.Series(0.0, index=close.index), close)
+    assert (q == 0.0).all()
+
+
+def test_dividend_yield_lowers_the_call_premium_collected():
+    """The defect: q=0 prices a call as if no dividend were coming, so the writer is paid
+    twice. Supplying the true q must reduce the premium booked."""
+    close, sigma, rates, schedule, dividends = _dividend_world()
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule,
+              dividends=dividends, ticker="S")
+    with_q = run_backtest(CoveredCall(target_delta=0.25), **kw)
+    without_q = run_backtest(
+        CoveredCall(target_delta=0.25),
+        div_yield=pd.Series(0.0, index=close.index), **kw
+    )
+    with_q.assert_identity()
+    without_q.assert_identity()
+    assert with_q.net_premium < without_q.net_premium, (
+        "pricing with q must collect less than pricing as if no dividend existed"
+    )
+
+
+def test_dividend_yield_shifts_the_chosen_strike():
+    """q enters strike selection too. With it omitted, a nominal 0.25-delta strike sits at
+    0.2375, so the pre-specified parameter quietly stops being the one in force."""
+    S, T, r, sigma, target = 160.0, 21 / 252, 0.042, 0.18, 0.25
+    k_no_q = strike_from_delta(S, T, r, sigma, target, "call", q=0.0)
+    k_with_q = strike_from_delta(S, T, r, sigma, target, "call", q=0.024)
+    assert k_with_q < k_no_q
+    # The q=0 strike, evaluated at the true q, is not the delta that was asked for.
+    assert abs(bs_delta(S, k_no_q, T, r, sigma, "call", q=0.024)) < target - 0.005
+    # The q-aware strike is.
+    assert abs(bs_delta(S, k_with_q, T, r, sigma, "call", q=0.024)) == pytest.approx(
+        target, abs=1e-9
+    )
+
+
+def test_identity_holds_with_a_dividend_yield():
+    close, sigma, rates, schedule, dividends = _dividend_world()
+    for strategy in (
+        BuyHold(),
+        CoveredCall(target_delta=0.25),
+        ProtectivePut(strike_rule="moneyness", otm_pct=0.05),
+    ):
+        result = run_backtest(
+            strategy, close, sigma, rates, schedule, dividends=dividends, ticker="S"
+        )
+        result.assert_identity()
+
+
+def test_dividend_yield_is_capped_so_strike_inversion_stays_solvable():
+    """A special dividend or a collapsed price can imply a yield that pushes
+    target*exp(qT) past 1, which has no solution. The cap keeps it invertible."""
+    idx = pd.bdate_range("2023-01-02", periods=300)
+    close = pd.Series(10.0, index=idx)          # a price that has collapsed
+    dividends = pd.Series(0.0, index=idx)
+    dividends.iloc[10] = 8.0                    # an enormous special dividend
+    q = trailing_dividend_yield(dividends, close, max_yield=0.25)
+    assert q.max() <= np.log1p(0.25) + 1e-12
+    # And it is still usable for strike selection.
+    strike_from_delta(10.0, 21 / 252, 0.04, 0.30, 0.25, "call", q=float(q.max()))

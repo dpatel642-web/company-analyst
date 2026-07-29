@@ -81,6 +81,7 @@ class ProtectivePut:
                     sigma,
                     self.target_delta,
                     "put",
+                    q=ctx.div_yield,
                 ),
                 2,
             )

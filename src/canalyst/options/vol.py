@@ -72,3 +72,46 @@ def apply_markup(sigma: pd.Series | float, iv_markup: float = 1.0):
     if iv_markup <= 0:
         raise ValueError(f"iv_markup must be positive, got {iv_markup!r}")
     return sigma * iv_markup
+
+
+def trailing_dividend_yield(
+    dividends: pd.Series,
+    close: pd.Series,
+    window_days: int = 252,
+    max_yield: float = 0.25,
+) -> pd.Series:
+    """Continuous dividend yield q, from trailing dividends over spot.
+
+    Black-Scholes needs this and omitting it is not conservative, it is a one-signed
+    transfer to whoever is short the option. With q left at zero the model's forward is
+    `S` rather than `S·e^{-qT}`, so a call is priced as though no dividend were coming
+    while the share leg separately receives the dividend in cash. The writer is paid
+    twice and the error is never refunded, because intrinsic value at expiry does not
+    depend on q. Measured at a 2.4% yield it is worth about 59bp a year, and 141bp at 6%.
+
+    Trailing rather than forward-looking on purpose: a forward estimate would be
+    lookahead. The cost is that a yield change is recognised late, which is the right
+    direction for a backtest.
+
+    `max_yield` caps the estimate. A special dividend inside the window, or a price that
+    has collapsed, can otherwise imply a yield that would push `target_delta * exp(qT)`
+    past 1 and make the strike inversion unsolvable.
+    """
+    if window_days < 1:
+        raise ValueError(f"window_days must be >= 1, got {window_days!r}")
+    if max_yield <= 0:
+        raise ValueError(f"max_yield must be positive, got {max_yield!r}")
+
+    paid = dividends.reindex(close.index).fillna(0.0)
+    trailing = paid.rolling(window_days, min_periods=1).sum()
+    # Annualise a partial window, so early bars are not understated simply for being early.
+    elapsed = pd.Series(
+        np.minimum(np.arange(1, len(close) + 1), window_days), index=close.index
+    )
+    annualised = trailing * (window_days / elapsed)
+
+    simple = (annualised / close).clip(lower=0.0, upper=max_yield)
+    # Continuous compounding, to match how bs.py consumes q.
+    out = np.log1p(simple)
+    out.name = "dividend_yield"
+    return out

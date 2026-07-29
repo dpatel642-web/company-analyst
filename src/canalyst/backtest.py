@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 
 from .options.bs import bs_price
+from .options.vol import trailing_dividend_yield
 from .strategies.base import BarContext, OpenPosition, OptionSpec, Strategy
 
 TRADING_DAYS = 252
@@ -98,9 +99,17 @@ def _mark(
     rate: float,
     sigma: float,
     quantity: float,
+    div_yield: float = 0.0,
 ) -> float:
-    """Signed market value of a position. Short positions mark negative."""
-    unit = bs_price(spot, strike, max(years, 0.0), rate, max(sigma, 0.0), position_kind)
+    """Signed market value of a position. Short positions mark negative.
+
+    `div_yield` is not optional in spirit. Pricing with q=0 on a dividend payer while the
+    share leg separately banks the dividend pays the option writer twice.
+    """
+    unit = bs_price(
+        spot, strike, max(years, 0.0), rate, max(sigma, 0.0), position_kind,
+        q=max(div_yield, 0.0),
+    )
     return quantity * unit
 
 
@@ -111,6 +120,7 @@ def run_backtest(
     rate: pd.Series,
     schedule: pd.DataFrame,
     dividends: pd.Series | None = None,
+    div_yield: pd.Series | None = None,
     starting_equity: float | None = None,
     fee_per_contract: float = 0.0,
     ticker: str = "",
@@ -149,6 +159,11 @@ def run_backtest(
     dividends = (
         pd.Series(0.0, index=index) if dividends is None else dividends.reindex(index).fillna(0.0)
     )
+    if div_yield is None:
+        # Derive it rather than defaulting to zero: a silent q=0 on a dividend payer is a
+        # one-signed transfer to the option writer, not a neutral simplification.
+        div_yield = trailing_dividend_yield(dividends, close)
+    div_yield = div_yield.reindex(index).ffill().fillna(0.0)
     expiry_by_roll = schedule["expiry"].to_dict() if len(schedule) else {}
     position_of_index = {d: i for i, d in enumerate(index)}
     dt = 1.0 / TRADING_DAYS
@@ -172,6 +187,7 @@ def run_backtest(
         vol = float(sigma.iloc[i])
         r = float(rate.iloc[i])
         div_per_share = float(dividends.iloc[i])
+        q = float(div_yield.iloc[i])
 
         shares_at_open = shares
         cash_at_open = cash
@@ -189,7 +205,9 @@ def run_backtest(
             years = max(
                 (position_of_index[pos.expiry] - i) / TRADING_DAYS, 0.0
             ) if pos.expiry in position_of_index else 0.0
-            mark = _mark(pos.kind, pos.strike, spot, years, r, vol, pos.quantity)
+            mark = _mark(
+                pos.kind, pos.strike, spot, years, r, vol, pos.quantity, div_yield=q
+            )
             option_mtm_change += mark - pos.last_mark
             marked.append(
                 OpenPosition(spec=pos.spec, opened_on=pos.opened_on, last_mark=mark)
@@ -227,6 +245,7 @@ def run_backtest(
             sigma=vol,
             rate=r,
             dividend=div_per_share,
+            div_yield=q,
             is_roll=is_roll,
             expiry=expiry,
             years_to_expiry=years_to_expiry,
@@ -248,7 +267,9 @@ def run_backtest(
                 if spec.expiry in position_of_index
                 else 0.0
             )
-            mark = _mark(spec.kind, spec.strike, spot, years, r, vol, spec.quantity)
+            mark = _mark(
+                spec.kind, spec.strike, spot, years, r, vol, spec.quantity, div_yield=q
+            )
             cash -= mark  # short position: mark is negative, so cash rises
             net_premium += -mark
             book.append(OpenPosition(spec=spec, opened_on=day, last_mark=mark))

@@ -58,6 +58,11 @@ class BarContext:
     #: Capital available right now, after marking and settling but before trading.
     #: Strategies size against this so a losing run deleverages instead of borrowing.
     equity: float = 0.0
+    #: Continuous dividend yield, used for pricing AND for strike selection. Both matter:
+    #: with q omitted the premium is wrong, and the strike chosen for a nominal 0.25 delta
+    #: actually sits at 0.2375, so the pre-specified parameter quietly stops being the
+    #: parameter in force.
+    div_yield: float = 0.0
 
 
 @dataclass(frozen=True)
