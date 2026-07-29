@@ -122,8 +122,14 @@ def _write_cache(
     csv_path, meta_path = _cache_paths(cache_dir, history.ticker, history.source)
     out = history.frame.copy()
     out["TotalReturnClose"] = history.total_return_close
-    out.to_csv(csv_path, index_label="Date")
-    meta_path.write_text(
+
+    # Write both files to temporaries and rename. The two-file write is not atomic, and
+    # interrupting between the CSV and the JSON leaves a narrow frame stamped with the
+    # previous wide requested range, which the coverage check then honours as a hit.
+    csv_tmp = csv_path.with_suffix(".csv.tmp")
+    meta_tmp = meta_path.with_suffix(".json.tmp")
+    out.to_csv(csv_tmp, index_label="Date")
+    meta_tmp.write_text(
         json.dumps(
             {
                 "ticker": history.ticker,
@@ -143,6 +149,8 @@ def _write_cache(
             indent=2,
         )
     )
+    csv_tmp.replace(csv_path)
+    meta_tmp.replace(meta_path)
 
 
 def _read_cache(

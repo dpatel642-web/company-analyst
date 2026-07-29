@@ -275,3 +275,201 @@ def test_assess_rejects_empty_history(tsla_split):
     )
     with pytest.raises(ValueError, match="empty"):
         assess(empty, asof=ASOF)
+
+
+# ============ BACKLOG #2-5: holes the round-1 review found, each pinned by a corruption
+
+
+def _with_split(history, day: str, ratio: float, applied: bool) -> PriceHistory:
+    """Inject a split. `applied=False` leaves the pre-split prices unscaled, i.e. the feed
+    reported the split but never folded it into history."""
+    frame = history.frame.copy()
+    total = history.total_return_close.copy()
+    frame.loc[pd.Timestamp(day), "Splits"] = ratio
+    if not applied:
+        pre = frame.index < pd.Timestamp(day)
+        for column in ["Open", "High", "Low", "Close"]:
+            frame.loc[pre, column] = frame.loc[pre, column] * ratio
+        total.loc[pre] = total.loc[pre] * ratio
+    return PriceHistory("X", frame, total, "fixture", history.fetched_at)
+
+
+# ---- #5 splits are now actually cross-referenced, at ANY ratio
+
+
+@pytest.mark.parametrize("ratio", [1.05, 1.25, 1.3333, 1.40, 1.50, 2.0, 3.0])
+def test_unadjusted_split_is_caught_at_every_detectable_ratio(tsla_split, ratio):
+    """The hole: split consistency was enforced only by the 40% outlier threshold, so
+    anything under e^0.40 = 1.4918 escaped entirely. A 5-for-4, a 4-for-3, a 7-for-5 and
+    every 5% stock dividend passed as CLEAN while the report printed the split it had
+    failed to check."""
+    broken = _with_split(tsla_split, "2022-09-01", ratio, applied=False)
+    report = assess(broken, asof=ASOF)
+    assert report.unadjusted_splits, f"ratio {ratio} escaped the cross-reference"
+    day, seen_ratio, move = report.unadjusted_splits[0]
+    assert day == "2022-09-01"
+    assert seen_ratio == pytest.approx(ratio)
+    assert not report.clean
+    assert any("never folded into history" in f for f in report.failures)
+
+
+@pytest.mark.parametrize("ratio", [1.05, 1.25, 1.50, 3.0])
+def test_correctly_applied_split_is_not_flagged(tsla_split, ratio):
+    """A split Yahoo already folded in leaves no discontinuity, so it must stay silent."""
+    fine = _with_split(tsla_split, "2022-09-01", ratio, applied=True)
+    report = assess(fine, asof=ASOF)
+    assert report.unadjusted_splits == []
+    assert report.clean, report.failures
+
+
+def test_small_split_escapes_the_outlier_threshold_but_not_the_cross_reference(tsla_split):
+    """Proves the two checks are independent, which is the whole point."""
+    broken = _with_split(tsla_split, "2022-09-01", 1.25, applied=False)
+    report = assess(broken, asof=ASOF)
+    assert report.outliers == [], "a 1.25 ratio is only a -22% move, under the threshold"
+    assert report.unadjusted_splits, "but the cross-reference must still catch it"
+
+
+# ---- #3 duplicated rows, and row count vs session count
+
+
+def test_duplicated_session_row_is_caught(tsla_split):
+    """Set differences cannot see a duplicate: `missing` and `unexpected` are both empty."""
+    frame = tsla_split.frame.copy()
+    dupe = pd.Timestamp("2022-08-24")
+    frame = pd.concat([frame, frame.loc[[dupe]]]).sort_index()
+    total = pd.concat(
+        [tsla_split.total_return_close, tsla_split.total_return_close.loc[[dupe]]]
+    ).sort_index()
+
+    report = assess(PriceHistory("TSLA", frame, total, "fixture", tsla_split.fetched_at),
+                    asof=ASOF)
+    assert dupe in report.duplicate_rows
+    assert report.missing_sessions == [] and report.unexpected_rows == []
+    assert not report.clean
+    assert any("duplicated session row" in f for f in report.failures)
+
+
+# ---- #2 shortness against the requested window is reported
+
+
+def test_short_window_is_reported_against_the_request(tsla_split):
+    """The live bug: RDDT asked for 5 years, got 2.4, and reported clean. A legitimately
+    short history is fine; reporting it as five years is not."""
+    report = assess(
+        tsla_split,
+        requested_start="2021-07-29",
+        requested_end="2022-09-30",
+        asof=ASOF,
+    )
+    assert report.missing_head_sessions > 200, report.missing_head_sessions
+    assert any("SHORT OF REQUEST" in n for n in report.notes)
+    assert "requested window" in report.render()
+    # Still not an ERROR: a recent listing is short for a real reason.
+    assert report.clean, report.failures
+
+
+def test_full_window_reports_no_shortfall(tsla_split):
+    report = assess(
+        tsla_split,
+        requested_start=tsla_split.frame.index[0],
+        requested_end=tsla_split.frame.index[-1],
+        asof=ASOF,
+    )
+    assert report.missing_head_sessions == 0
+    assert report.missing_tail_sessions == 0
+    assert not any("SHORT OF REQUEST" in n for n in report.notes)
+
+
+def test_absent_request_is_disclosed(tsla_split):
+    report = assess(tsla_split, asof=ASOF)
+    assert any("shortness could not be checked" in n for n in report.notes)
+
+
+# ---- #4 risk-free coverage is now visible and checkable
+
+
+def test_thin_risk_free_coverage_is_a_failure(tsla_split):
+    """A truncated ^IRX response used to become a five-year constant, a 3.5pp one-signed
+    error that alone flips a `sharpe >= 1` verdict."""
+    idx = tsla_split.frame.index
+    rf = pd.Series(0.0005, index=idx)
+    had_print = pd.Series(False, index=idx)
+    had_print.iloc[:3] = True  # three real prints for a whole window
+
+    report = assess(tsla_split, rf=rf, rf_had_print=had_print, asof=ASOF)
+    assert not report.clean
+    assert any("real print on only" in f for f in report.failures)
+
+
+def test_good_risk_free_coverage_passes(tsla_split):
+    idx = tsla_split.frame.index
+    report = assess(
+        tsla_split,
+        rf=pd.Series(0.04, index=idx),
+        rf_had_print=pd.Series(True, index=idx),
+        asof=ASOF,
+    )
+    assert report.clean, report.failures
+    assert report.rf_sessions_with_print == len(idx)
+
+
+def test_mis_scaled_risk_free_is_caught(tsla_split):
+    """540 read as 5.40 yields a 186% rate, and nothing downstream would question it."""
+    idx = tsla_split.frame.index
+    rf = pd.Series(0.04, index=idx)
+    rf.iloc[10] = 1.856
+    report = assess(
+        tsla_split, rf=rf, rf_had_print=pd.Series(True, index=idx), asof=ASOF
+    )
+    assert report.rf_out_of_bounds == 1
+    assert not report.clean
+    assert any("scaling error" in f for f in report.failures)
+
+
+def test_split_too_small_to_verify_declines_rather_than_guessing(tsla_split):
+    """Honest limit, and where it actually falls.
+
+    A relative tolerance made 1.05 verifiable in both directions, which an absolute log
+    tolerance could not do: it flagged correctly-adjusted 1.05 splits as broken. But the
+    limit still exists. A 1.01 stock dividend implies a -1% move, indistinguishable from an
+    ordinary down day, so the check declines explicitly instead of guessing either way.
+    """
+    for applied in (True, False):
+        broken = _with_split(tsla_split, "2022-09-01", 1.01, applied=applied)
+        report = assess(broken, asof=ASOF)
+        assert report.unadjusted_splits == []
+        assert any("too small to verify" in n for n in report.notes)
+
+
+def test_relative_tolerance_is_what_makes_small_splits_verifiable(tsla_split):
+    """Pin the reason. Under the old absolute 0.15 log tolerance, the band around
+    -log(1.05) = -0.0488 spanned -0.199 to +0.101 and swallowed almost any trading day."""
+    import numpy as np
+    from canalyst.data.quality import SPLIT_MATCH_TOLERANCE
+
+    expected = -np.log(1.05)
+    relative_band = SPLIT_MATCH_TOLERANCE * abs(expected)
+    assert relative_band < 0.02, "the band must be narrow enough to exclude a normal day"
+    # A correctly-adjusted 1.05 split sits outside it; an unadjusted one sits inside.
+    applied = _with_split(tsla_split, "2022-09-01", 1.05, applied=True)
+    unapplied = _with_split(tsla_split, "2022-09-01", 1.05, applied=False)
+    assert assess(applied, asof=ASOF).unadjusted_splits == []
+    assert assess(unapplied, asof=ASOF).unadjusted_splits
+
+
+def test_reverse_split_is_also_checked(tsla_split):
+    """A 1-for-3 reverse split is ratio 0.3333 and must not slip past the floor check."""
+    frame = tsla_split.frame.copy()
+    total = tsla_split.total_return_close.copy()
+    day = pd.Timestamp("2022-09-01")
+    frame.loc[day, "Splits"] = 1 / 3
+    pre = frame.index < day
+    for column in ["Open", "High", "Low", "Close"]:
+        frame.loc[pre, column] = frame.loc[pre, column] / 3.0
+    total.loc[pre] = total.loc[pre] / 3.0
+    report = assess(
+        PriceHistory("X", frame, total, "fixture", tsla_split.fetched_at), asof=ASOF
+    )
+    assert report.unadjusted_splits, "a reverse split left unadjusted must be caught"
+    assert not any("too small to verify" in n for n in report.notes)

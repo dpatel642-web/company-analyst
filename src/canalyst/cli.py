@@ -22,6 +22,7 @@ import pandas as pd
 from .backtest import run_backtest
 from .data.calendar import roll_schedule
 from .data.prices import load_history
+from .data.providers.nasdaq_p import NasdaqTailProvider
 from .data.quality import assess
 from .data.riskfree import risk_free_series
 from .metrics import Performance, summarise
@@ -38,12 +39,6 @@ def _prepare(ticker: str, years: float, use_cache: bool = True):
     raw_start = end - pd.DateOffset(years=years) - pd.Timedelta(days=150)
 
     history = load_history(ticker, raw_start, end, use_cache=use_cache)
-    quality = assess(history)
-    if not quality.clean:
-        raise RuntimeError(
-            f"{ticker}: data failed integrity checks: {'; '.join(quality.failures)}"
-        )
-
     close_full = history.close
     sigma_full = close_to_close(close_full, window=VOL_LOOKBACK)
     window_start = end - pd.DateOffset(years=years)
@@ -53,11 +48,30 @@ def _prepare(ticker: str, years: float, use_cache: bool = True):
     if len(close) < 200:
         raise RuntimeError(f"{ticker}: only {len(close)} usable bars")
 
+    rf, rf_had_print = risk_free_series(close.index, return_coverage=True)
+
+    # Corroborate the recent tail. The CLI used to call assess() with no second source,
+    # so the integrity gate ran with zero external corroboration and still returned clean.
+    tail = NasdaqTailProvider().recent_closes(ticker)
+    quality = assess(
+        history,
+        tail_closes=tail,
+        tail_source="nasdaq",
+        requested_start=raw_start,
+        requested_end=end,
+        rf=rf,
+        rf_had_print=rf_had_print,
+    )
+    if not quality.clean:
+        raise RuntimeError(
+            f"{ticker}: data failed integrity checks: {'; '.join(quality.failures)}"
+        )
+
     return (
         close,
         sigma_full.loc[mask],
         history.dividends.reindex(close.index).fillna(0.0),
-        risk_free_series(close.index),
+        rf,
         roll_schedule(pd.DatetimeIndex(close.index)),
         quality,
     )
@@ -66,7 +80,7 @@ def _prepare(ticker: str, years: float, use_cache: bool = True):
 def _evaluate(
     ticker: str, years: float, delta: float, markup: float, use_cache: bool = True
 ) -> dict:
-    close, realised, dividends, rf, schedule, _ = _prepare(ticker, years, use_cache)
+    close, realised, dividends, rf, schedule, quality = _prepare(ticker, years, use_cache)
     common = dict(
         close=close, sigma=apply_markup(realised, markup), rate=rf,
         schedule=schedule, dividends=dividends, ticker=ticker,
@@ -84,6 +98,10 @@ def _evaluate(
 
     return {
         "ticker": ticker,
+        "from": close.index[0].date(),
+        "to": close.index[-1].date(),
+        "years": round(bh.elapsed_years, 2),
+        "short": quality.missing_head_sessions + quality.missing_tail_sessions > 5,
         "vol": bh.annual_vol,
         "bh_return": bh.cumulative_return,
         "bh_sharpe": bh.sharpe_daily,
@@ -146,10 +164,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     )
     print("=" * 96)
     display = frame[
-        ["vol", "cc_vol", "bh_return", "cc_return", "bh_sharpe", "cc_sharpe",
-         "beats_bh", "sharpe_over_1"]
+        ["years", "short", "vol", "cc_vol", "bh_return", "cc_return", "bh_sharpe",
+         "cc_sharpe", "beats_bh", "sharpe_over_1"]
     ].rename(
         columns={
+            "years": "yrs", "short": "SHORT",
             "vol": "BH vol", "cc_vol": "CC vol", "bh_return": "BH ret",
             "cc_return": "CC ret", "bh_sharpe": "BH Sharpe", "cc_sharpe": "CC Sharpe",
             "beats_bh": "CC>BH", "sharpe_over_1": "Sharpe>=1",
@@ -166,6 +185,13 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             )
         )
     print()
+    short = frame[frame["short"]]
+    if len(short):
+        print(
+            f"WARNING: {len(short)} ticker(s) returned materially less than the "
+            f"requested window: {', '.join(short.index)}. Their 'yrs' column is the "
+            "real span; do not read them as full-window results."
+        )
     print(f"beats buy and hold : {int(frame['beats_bh'].sum())} of {len(frame)}")
     print(f"Sharpe >= 1        : {int(frame['sharpe_over_1'].sum())} of {len(frame)}")
     if failures:

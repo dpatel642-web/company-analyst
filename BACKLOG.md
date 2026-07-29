@@ -1,12 +1,36 @@
 # Backlog
 
 Open defects from an adversarial review run 2026-07-29 (three agents: options/accounting,
-data layer, statistics). Six were fixed in `a563d49`; these are the survivors, ranked.
-Each has a concrete failure scenario, because a backlog item without one is a guess.
+data layer, statistics). Each has a concrete failure scenario, because a backlog item
+without one is a guess.
 
-**Do these before running a multi-ticker batch.** Every one of the top four biases either
-dividend payers or recent listings, and the intended universe is ~35 watchlist names that
-are mostly both.
+## Closed
+
+- Round one, six defects, `a563d49`: dividend-policy mismatch between benchmark and
+  overlay, partial bars persisted to cache, Sortino denominator, the telescoping
+  `verify()` tautology, the holiday-shifted-expiry right edge, unguarded CAGR.
+- **#1 dividend yield `q`** in pricing and strike selection.
+- **#2 short response** now reported: `assess` takes the requested window and computes the
+  shortfall at each end; `sweep` prints a `yrs` column and a `SHORT` flag and warns by
+  name. Verified live: RDDT reports 2.11y and ARM 2.64y against a 5y request, both
+  flagged, where both previously sat silently in a table headed "5y window". Cache writes
+  are now atomic (temp plus rename).
+- **#3 duplicated rows** detected explicitly, since set differences cannot see them, and
+  `rows != expected_sessions` is now a failure when nothing else explains it.
+- **#4 risk-free**: the fill is bounded to 7 days per print, `strict` guards a SHORT
+  response as well as a missing one, levels outside [-1%, 25%] are rejected as scaling
+  errors, and coverage is reported in the quality report. The docstring's understated
+  approximation error (8bp claimed, 15.4bp at 4% and 25.3bp at the 5.4% peak, negative
+  every day) is corrected.
+- **#5 splits** are now genuinely cross-referenced, at any ratio, using a tolerance
+  relative to `log(ratio)`. An absolute log tolerance was unusable: 0.15 around
+  `-log(1.05)` spans -0.199 to +0.101 and swallows almost any trading day. Ratios down to
+  1.05 are verifiable in both directions; below 1.03 the check declines explicitly, since a
+  1% stock dividend is not separable from a 1% down day.
+- **CLI now corroborates.** `backtest` and `sweep` previously called `assess` with no
+  second source and still returned clean.
+
+**Still open, and still before a multi-ticker batch.**
 
 ---
 
