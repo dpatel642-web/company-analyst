@@ -1,0 +1,34 @@
+[project]
+name = "canalyst"
+version = "0.1.0"
+description = "Company analysis toolkit: price history, option overlays, backtests. Read-only."
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "yfinance",
+    "exchange_calendars",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+canalyst = "canalyst.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    # yfinance leans on urllib3/pandas internals that emit deprecations we do not control.
+    "ignore::DeprecationWarning:yfinance.*",
+]

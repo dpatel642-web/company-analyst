@@ -1,0 +1,2 @@
+[console_scripts]
+canalyst = canalyst.cli:main
