@@ -54,10 +54,17 @@ IV_MARKUP_GRID = [1.00, 1.10, 1.20]
 DELTA_GRID = [0.15, 0.25, 0.40]
 RULE = "=" * 78
 
+#: The cross-ticker universe, recorded so the writeup's claim about it is reproducible.
+#: A previous draft said "ten large caps" with no list anywhere in the repo, which meant a
+#: reader could not tell 1-of-10 from the survivor of a wider search.
+SWEEP_UNIVERSE = [
+    "TSLA", "KO", "JNJ", "WMT", "COST", "MSFT", "AAPL", "SPY", "LLY", "PG",
+]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ticker", default="TSLA")
+    p.add_argument("--ticker", default="WMT")
     p.add_argument("--years", type=float, default=5.0)
     p.add_argument("--delta", type=float, default=TARGET_DELTA)
     p.add_argument(
@@ -84,7 +91,10 @@ def main() -> int:
     print(RULE)
     history = load_history(ticker, raw_start, end, use_cache=not args.no_cache)
     tail = NasdaqTailProvider().recent_closes(ticker)
-    quality = assess(history, tail_closes=tail, tail_source="nasdaq")
+    quality = assess(
+        history, tail_closes=tail, tail_source="nasdaq",
+        requested_start=raw_start, requested_end=end,
+    )
     print(quality.render())
     if not quality.clean:
         print("\nSTOPPING: the data did not pass its integrity checks.")
@@ -227,6 +237,33 @@ def main() -> int:
     print(return_grid.to_string(float_format=lambda v: f"{v:>9.2%}"))
     print(f"\nbuy and hold cumulative return for reference: "
           f"{bh_perf.cumulative_return:.2%}")
+
+    # The only like-for-like markup comparison: the PRE-SPECIFIED delta, at each markup.
+    # Quoting the grid's best cell against the pre-specified cell's baseline is how a
+    # sensitivity gets laundered into a result, and an earlier draft of the writeup did
+    # exactly that.
+    row = f"{args.delta:.2f}d"
+    print(f"\nLIKE-FOR-LIKE, at the pre-specified {args.delta:.2f} delta only:")
+    for column in return_grid.columns:
+        ret, shp = return_grid.loc[row, column], sharpe_grid.loc[row, column]
+        verdict = "beats" if ret > bh_perf.cumulative_return else "loses to"
+        print(f"  {column}: {ret:+7.2%}  Sharpe {shp:.2f}   -> {verdict} buy and hold")
+
+    print("\nCALENDAR-YEAR ATTRIBUTION (is any edge broad, or one year?)")
+    years = pd.DataFrame({
+        "buy and hold": bh_perf.calendar_years,
+        "covered call": cc_perf.calendar_years,
+        "protective put": put_perf.calendar_years,
+    })
+    years["cc - bh"] = years["covered call"] - years["buy and hold"]
+    print(years.to_string(float_format=lambda v: f"{v:+8.2%}"))
+    beat = int((years["cc - bh"] > 0).sum())
+    print(f"\n  covered call beat buy and hold in {beat} of {len(years)} calendar years")
+    for drop in years.index:
+        ex = lambda s: (1 + s.drop(drop)).prod() - 1  # noqa: E731
+        if abs(years.loc[drop, "cc - bh"]) > 0.05:
+            print(f"  excluding {drop}: buy and hold {ex(years['buy and hold']):+.2%} "
+                  f"vs covered call {ex(years['covered call']):+.2%}")
 
     fig3 = plot_sensitivity(
         sharpe_grid, outdir / f"{ticker}_03_sensitivity.png",

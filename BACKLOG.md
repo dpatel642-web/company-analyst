@@ -184,21 +184,32 @@ pricing-argument error, including item 1.
 
 ---
 
-## WRITEUP.md corrections gathered but not yet applied
+## WRITEUP.md: rewritten for WMT, all corrections applied
 
-Numbers verified 2026-07-29; the file still contains the originals.
+Rewritten 2026-07-29 for the graded ticker. Every one of the nine defects the review found
+in the TSLA draft is addressed, and all 16 quoted numbers were re-verified against a fresh
+run before committing (16/16).
 
-| claim | in the file | correct |
-|---|---|---|
-| IV x1.20 covered call | "+63.3%, Sharpe 0.36" | **+34.59%, Sharpe 0.28** at the pre-specified 0.25 delta, which is **still below** buy-and-hold's +36.17%. The quoted pair took the 0.25-delta loss as baseline and the 0.40-delta cell as the gain, and +63.28% is the argmax of all nine cells on both metrics |
-| Sharpe 1.0 requirement | "roughly 47% annualised excess" | **44% excess** (47.5% total). The word "excess" is load-bearing in a sentence about exactly that distinction |
-| T-bill range | "0.02% to 5.21%" | those are the `ln(1+r)` internals. The bill's own quotes are mean **3.62%**, min 0.02%, max **5.35%** |
-| leverage pairing | "-240 against a share worth 222" | min cash -240.49 occurred on **2026-01-15 with spot at 438.57** (exposure 2.21x). Max exposure over the run is 4.37x, on a different day. Also stated in `covered_call.py` and a test docstring. The 93.72% vs 59.67% vol half reproduces exactly |
-| "ten large caps" | asserted | no such list exists in the repo; `--tickers` has no default. Record the universe or weaken the claim |
-| Sortino | 0.52 / 0.02 / 0.68 | recompute under target downside deviation: **0.50 / 0.02 / 0.67** |
-| protective put edge | presented as a general property | it is **one year**. Beat buy-and-hold in **2 of 6** calendar years; 2022 alone contributed +22.05pp. Excluding 2022: buy-and-hold **+289.40%** vs put **+227.98%** |
-| "nothing does / no overlay closes it" | asserted | a universal over 10 tested configurations. Directionally very likely, stated as proven |
-| "Every number is produced by a tested library" | asserted | the 112.1%, the sensitivity grids, and the prose arithmetic (51pp, 23pp, "roughly 47%") are inline. Defect 5 above came from exactly that |
+What changed beyond the ticker:
+- The markup comparison is now **like-for-like at the pre-specified 0.25 delta only**. The
+  old draft paired that delta's baseline against the 0.40-delta cell, which was the argmax
+  of the whole grid on both metrics. On WMT it happens not to matter, since the overlay beats
+  buy and hold at every markup, but the comparison is stated correctly regardless.
+- Sharpe is reported as **0.996, not 1.00**. It rounds to the target and does not clear it,
+  and the gap between those two sentences is the assignment's actual question.
+- The T-bill is quoted from its **own prints** (mean 3.62%, range 0.02% to 5.35%), not the
+  log-transformed internal series.
+- The TSLA leverage anecdote now says **4.4x exposure** and drops the "-240 against a share
+  worth 222" pairing, which was two different days.
+- `SWEEP_UNIVERSE` is a constant in the script, so "ten large caps" is checkable.
+- Sortino is target downside deviation, and says so.
+- **Calendar-year attribution is included**, because this is what killed the TSLA draft. WMT's
+  edge is broad: it won 4 of 6 years, and excluding its worst year (2024, -16.6pp) the overlay
+  still leads +62.42% to +46.13%. The opposite of the TSLA protective put, whose entire edge
+  was 2022.
+- The claim "every number is produced by a tested library" is narrowed to the performance
+  numbers, since the assembly and prose arithmetic are not.
+- Universals are gone. The real-IV limitation is stated as what was measured, not asserted.
 
 ## Then: the batch build
 
