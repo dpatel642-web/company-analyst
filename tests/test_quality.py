@@ -96,7 +96,6 @@ def test_row_that_is_not_a_session_is_caught(tsla_split):
         ("Low", 9_999.0, "high < low"),
         ("Close", 9_999.0, "close outside [low, high]"),
         ("Open", 0.01, "open outside [low, high]"),
-        ("Volume", 0.0, "non-positive volume"),
     ],
 )
 def test_impossible_bar_is_caught(tsla_split, column, value, label):
@@ -473,3 +472,123 @@ def test_reverse_split_is_also_checked(tsla_split):
     )
     assert report.unadjusted_splits, "a reverse split left unadjusted must be caught"
     assert not any("too small to verify" in n for n in report.notes)
+
+
+# ===================== the outlier gate: classify, do not blanket-reject =====================
+#
+# The gate rejected 11 of 35 watchlist names, almost all for REAL moves: BMNR +694.8%,
+# AMC +95.2%, NWBO -58.2%, NFLX's genuine 2022-04-20 crash. Every test below distinguishes a
+# real event from a data error, because a tier that cannot tell them apart is just a way of
+# ignoring problems.
+
+
+def _spike(history, day: str, factor: float, revert: bool, volume_factor: float = 3.0):
+    """Inject a large move. `revert=True` makes it round-trip, like a bad print."""
+    frame = history.frame.copy()
+    total = history.total_return_close.copy()
+    idx = frame.index
+    position = idx.get_loc(pd.Timestamp(day))
+    target = idx[position]
+
+    if revert:
+        rows = [target]  # one bar wrong, price returns next session
+    else:
+        rows = list(idx[position:])  # a step: everything after moves too
+
+    for column in ["Open", "High", "Low", "Close"]:
+        frame.loc[rows, column] = frame.loc[rows, column] * factor
+    total.loc[rows] = total.loc[rows] * factor
+    frame.loc[target, "Volume"] = frame["Volume"].median() * volume_factor
+    return PriceHistory("X", frame, total, "fixture", history.fetched_at)
+
+
+def test_reverting_spike_is_a_data_error(tsla_split):
+    """A price that jumps and comes straight back means one bar was wrong."""
+    broken = _spike(tsla_split, "2022-08-24", 1.9, revert=True)
+    report = assess(broken, asof=ASOF)
+    assert report.unexplained_outliers, "a round-trip must be caught"
+    assert not report.clean
+    assert any("round-trip" in f for f in report.failures)
+    assert report.event_outliers == []
+
+
+def test_persistent_move_on_good_volume_is_a_real_event(tsla_split):
+    """The case that cost 11 names. A step change on heavy volume is news, not corruption."""
+    broken = _spike(tsla_split, "2022-08-24", 1.9, revert=False, volume_factor=4.0)
+    report = assess(broken, asof=ASOF)
+    assert report.event_outliers, "a persistent traded move must be classified as an event"
+    assert report.unexplained_outliers == []
+    assert report.clean, report.failures
+    assert any("real event" in w for w in report.warnings)
+
+
+def test_persistent_move_on_thin_volume_warns_separately(tsla_split):
+    """Price moved violently while nobody traded. Suspicious, but it did persist, so it is
+    disclosed rather than treated as a print error."""
+    broken = _spike(tsla_split, "2022-08-24", 1.9, revert=False, volume_factor=0.05)
+    report = assess(broken, asof=ASOF)
+    assert report.low_volume_outliers
+    assert report.event_outliers == []
+    assert report.clean, report.failures
+    assert any("thin volume" in w for w in report.warnings)
+
+
+def test_acknowledged_event_needs_no_threshold_change(tsla_split):
+    """A caller can whitelist a known date instead of loosening a global threshold."""
+    broken = _spike(tsla_split, "2022-08-24", 1.9, revert=True)
+    report = assess(
+        broken, asof=ASOF, acknowledged_events=["2022-08-24"]
+    )
+    assert report.acknowledged_outliers
+    assert report.unexplained_outliers == []
+    assert report.clean, report.failures
+    assert any("acknowledged" in w for w in report.warnings)
+
+
+def test_unapplied_split_still_lands_in_unexplained_outliers(tsla_split):
+    """The design detail found only by writing the patch.
+
+    An unapplied split is a ONE-WAY step, so the reversion test cannot see it. If
+    `unexplained_outliers` were defined as reversion alone, a 3x unadjusted split would be
+    classified as a real event and the field would silently stop meaning "this outlier is a
+    data problem". The split verdict has to populate it too.
+    """
+    broken = _with_split(tsla_split, "2022-09-01", 3.0, applied=False)
+    report = assess(broken, asof=ASOF)
+    assert report.unadjusted_splits
+    assert report.unexplained_outliers, "the split verdict must reach this field"
+    assert not report.clean
+
+
+# ------------------------------------------------------------------- zero volume, in tiers
+
+
+def test_one_zero_volume_bar_is_a_warning_not_a_failure(tsla_split):
+    """Yahoo reports zero volume for index tickers by design, and illiquid names genuinely do
+    not trade some sessions. As a hard failure this made `assess` unable to pass ^GSPC at all,
+    and it killed LOWLF on 276 untraded bars."""
+    broken = mutate(tsla_split, {("Volume", "2022-08-24"): 0.0})
+    report = assess(broken, asof=ASOF)
+    assert report.zero_volume_bars == 1
+    assert report.clean, report.failures
+    assert any("non-positive volume" in w for w in report.warnings)
+
+
+def test_mostly_zero_volume_is_a_failure(tsla_split):
+    """Past a threshold it stops being untraded sessions and becomes a wrong series."""
+    frame = tsla_split.frame.copy()
+    frame.loc[frame.index[:30], "Volume"] = 0.0
+    report = assess(
+        PriceHistory("X", frame, tsla_split.total_return_close.copy(), "fixture",
+                     tsla_split.fetched_at),
+        asof=ASOF,
+    )
+    assert not report.clean
+    assert any("wrong series" in f for f in report.failures)
+
+
+def test_clean_data_produces_no_warnings(tsla_split):
+    """The tier must not fire on ordinary data, or it becomes noise people learn to ignore."""
+    report = assess(tsla_split, asof=ASOF)
+    assert report.clean
+    assert report.warnings == []

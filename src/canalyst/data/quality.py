@@ -23,9 +23,30 @@ import pandas as pd
 from .calendar import last_completed_session, sessions
 from .prices import PriceHistory
 
-#: A daily move this large is either a real event or a broken adjustment. Every
-#: breach must be explained individually, never waved through in aggregate.
+#: A daily move this large gets CLASSIFIED, rather than waved through or blanket-rejected.
+#:
+#: Treating every large move as a data error cost 11 of 35 watchlist names, and almost all of
+#: them were real: BMNR +694.8%, AMC +95.2%, NWBO -58.2%, and NFLX's genuine 2022-04-20
+#: subscriber crash. A gate that cannot pass a volatile small cap is a gate people switch
+#: off, which is how an integrity layer dies.
+#:
+#: The threshold is on LOG returns while displays are simple, so a reported -35.1% is a log
+#: -0.43 and genuinely over the line. The old message put "over 40%" next to "-35.1%" and
+#: invited exactly the wrong conclusion.
 OUTLIER_LOG_RETURN = 0.40
+#: A real move persists. A bad print round-trips, because only one bar was wrong. If the move
+#: is undone to within this fraction of itself within REVERSION_WINDOW sessions, it is a print
+#: error rather than an event.
+REVERSION_FRACTION = 0.25
+REVERSION_WINDOW = 2
+#: A real move trades. Volume below this multiple of its trailing median means price moved
+#: violently while nobody traded, which is suspicious rather than disqualifying.
+MIN_VOLUME_RATIO = 0.5
+VOLUME_MEDIAN_WINDOW = 60
+#: Above this share of bars, zero volume stops being an oddity and becomes a wrong series.
+#: Below it, it is a warning: Yahoo reports zero volume for index tickers (^GSPC, ^VIX), and
+#: illiquid names genuinely do not trade on some sessions.
+MAX_ZERO_VOLUME_FRACTION = 0.10
 #: Tolerance for the independent close comparison on the recent tail.
 TAIL_TOLERANCE = 0.005
 #: How close a return on a split date must be to `-log(ratio)` before it counts as
@@ -74,7 +95,17 @@ class DataQualityReport:
     rf_out_of_bounds: int = 0
     dividend_total: float = 0.0
     outliers: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    #: Outliers judged DATA ERRORS: they round-trip, or match a split ratio. Hard failure.
+    #: NOTE both conditions, not reversion alone. An unapplied split is a ONE-WAY step and
+    #: never reverts, so reversion-only would classify it as a real event.
     unexplained_outliers: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    #: Outliers judged REAL EVENTS: large, persistent, traded. Warn, do not reject.
+    event_outliers: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    #: Persistent but on unusually thin volume. Warned about separately and loudly.
+    low_volume_outliers: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    #: Dates the caller declared known-real, so no global threshold need be loosened.
+    acknowledged_outliers: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    zero_volume_bars: int = 0
     adjustment_consistent: bool | None = None
     tail_checked: int = 0
     tail_disagreements: list[tuple[pd.Timestamp, float, float]] = field(
@@ -135,8 +166,15 @@ class DataQualityReport:
         if self.unexplained_outliers:
             day, move = self.unexplained_outliers[0]
             out.append(
-                f"{len(self.unexplained_outliers)} unexplained move(s) over "
-                f"{OUTLIER_LOG_RETURN:.0%}, first {day.date()} at {move:+.1%}"
+                f"{len(self.unexplained_outliers)} move(s) that look like DATA ERRORS, "
+                f"because they round-trip or match a split ratio. First {day.date()} at "
+                f"{move:+.1%} (simple; the threshold is {OUTLIER_LOG_RETURN:.2f} in logs)"
+            )
+        if self.rows and self.zero_volume_bars / self.rows > MAX_ZERO_VOLUME_FRACTION:
+            out.append(
+                f"{self.zero_volume_bars} of {self.rows} bars have non-positive volume "
+                f"({self.zero_volume_bars / self.rows:.0%}), which is a wrong series rather "
+                "than a few untraded sessions"
             )
         if self.adjustment_consistent is False:
             out.append("split/dividend adjustment is internally inconsistent")
@@ -149,7 +187,35 @@ class DataQualityReport:
         return out
 
     @property
+    def warnings(self) -> list[str]:
+        """Real but unusual. Disclosed, and deliberately NOT disqualifying.
+
+        The tier that was missing. Without it a large move had to be either invisible or
+        fatal, so a volatile small cap could not pass at all and 11 of 35 watchlist names were
+        rejected for moves that actually happened.
+        """
+        out: list[str] = []
+        for day, move in self.event_outliers:
+            out.append(
+                f"{day.date()}: {move:+.1%} move, persistent and traded, read as a real event"
+            )
+        for day, move in self.low_volume_outliers:
+            out.append(
+                f"{day.date()}: {move:+.1%} move on unusually thin volume. Persistent, so not "
+                "a print error, but corroborate it before trusting the bar"
+            )
+        for day, move in self.acknowledged_outliers:
+            out.append(f"{day.date()}: {move:+.1%} move, acknowledged by the caller")
+        if self.rows and 0 < self.zero_volume_bars / self.rows <= MAX_ZERO_VOLUME_FRACTION:
+            out.append(
+                f"{self.zero_volume_bars} bar(s) with non-positive volume. Index tickers "
+                "report zero by design and illiquid names do not trade on some sessions"
+            )
+        return out
+
+    @property
     def clean(self) -> bool:
+        """Keyed on failures only. A warning is information, not a veto."""
         return not self.failures
 
     def render(self) -> str:
@@ -167,8 +233,12 @@ class DataQualityReport:
             f"  splits in window  {self.splits or 'none'}",
             f"  duplicated rows   {len(self.duplicate_rows)}",
             f"  dividends paid    {self.dividend_total:.4f}",
-            f"  moves over {OUTLIER_LOG_RETURN:.0%}     "
-            f"{len(self.outliers)} ({len(self.unexplained_outliers)} unexplained)",
+            f"  large moves       {len(self.outliers)} total: "
+            f"{len(self.unexplained_outliers)} look like errors, "
+            f"{len(self.event_outliers)} real events, "
+            f"{len(self.low_volume_outliers)} on thin volume, "
+            f"{len(self.acknowledged_outliers)} acknowledged",
+            f"  zero-volume bars  {self.zero_volume_bars}",
             f"  adjustment self-consistent  {self.adjustment_consistent}",
         ]
         if self.requested_start is not None or self.requested_end is not None:
@@ -204,7 +274,9 @@ class DataQualityReport:
         verdict = "CLEAN" if self.clean else "FAILED"
         lines.append(f"  verdict           {verdict}")
         for failure in self.failures:
-            lines.append(f"    - {failure}")
+            lines.append(f"    FAIL: {failure}")
+        for warning in self.warnings:
+            lines.append(f"    warn: {warning}")
         return "\n".join(lines)
 
 
@@ -221,7 +293,6 @@ def _check_bars(frame: pd.DataFrame) -> dict[str, int]:
             ((open_ > high + eps) | (open_ < low - eps)).sum()
         ),
         "non-positive price": int((frame[["Open", "High", "Low", "Close"]] <= 0).any(axis=1).sum()),
-        "non-positive volume": int((frame["Volume"] <= 0).sum()),
         "missing price": int(frame[["Open", "High", "Low", "Close"]].isna().any(axis=1).sum()),
     }
 
@@ -270,6 +341,7 @@ def assess(
     tail_closes: pd.Series | None = None,
     tail_source: str | None = None,
     asof: pd.Timestamp | None = None,
+    acknowledged_events=None,
     requested_start=None,
     requested_end=None,
     rf: pd.Series | None = None,
@@ -331,7 +403,57 @@ def assess(
     log_ret = np.log(history.close / history.close.shift(1)).dropna()
     breaches = log_ret[log_ret.abs() > OUTLIER_LOG_RETURN]
     report.outliers = [(day, float(np.expm1(v))) for day, v in breaches.items()]
-    report.unexplained_outliers = list(report.outliers)
+    report.zero_volume_bars = int((frame["Volume"] <= 0).sum())
+
+    # Classify each outlier instead of rejecting the ticker. Signatures differ:
+    #   round-trips        -> only one bar was wrong, so it is a print error
+    #   thin volume        -> price moved violently while nobody traded, so suspicious
+    #   persistent, traded -> a real event, which is a warning and not a veto
+    # A split-date outlier is left to the cross-reference below, which owns that verdict.
+    close = history.close
+    volume = frame["Volume"]
+    median_volume = volume.rolling(VOLUME_MEDIAN_WINDOW, min_periods=5).median()
+    acknowledged = {
+        pd.Timestamp(d).normalize() for d in (acknowledged_events or [])
+    }
+    split_days = set(history.splits[history.splits > 0].index)
+
+    for day, move in report.outliers:
+        if day in acknowledged:
+            report.acknowledged_outliers.append((day, move))
+            continue
+        if day in split_days:
+            continue
+
+        magnitude = abs(float(log_ret.loc[day]))
+        position = close.index.get_loc(day)
+        reverted = False
+        if position > 0:
+            baseline = float(close.iloc[position - 1])
+            if baseline > 0:
+                for step in range(1, REVERSION_WINDOW + 1):
+                    if position + step >= len(close):
+                        break
+                    residual = abs(float(np.log(close.iloc[position + step] / baseline)))
+                    if residual < REVERSION_FRACTION * magnitude:
+                        reverted = True
+                        break
+        if reverted:
+            report.unexplained_outliers.append((day, move))
+            continue
+
+        typical = float(median_volume.get(day, np.nan))
+        traded = float(volume.get(day, np.nan))
+        thin = (
+            np.isfinite(typical)
+            and typical > 0
+            and np.isfinite(traded)
+            and traded < MIN_VOLUME_RATIO * typical
+        )
+        if thin:
+            report.low_volume_outliers.append((day, move))
+        else:
+            report.event_outliers.append((day, move))
 
     # The actual split cross-reference. This used to be a comment claiming a check that
     # did not exist: `unexplained_outliers` was simply a copy of `outliers`, so split
@@ -361,6 +483,12 @@ def assess(
             report.unadjusted_splits.append(
                 (str(day.date()), float(ratio), float(np.expm1(observed)))
             )
+            # One-way step: it never reverts, so the reversion test above cannot see it.
+            # Record it here too, or `unexplained_outliers` silently stops meaning
+            # "this outlier is a data problem".
+            for candidate_day, candidate_move in report.outliers:
+                if candidate_day == day:
+                    report.unexplained_outliers.append((candidate_day, candidate_move))
 
     # Freshness. An in-progress bar should already have been dropped upstream; if one
     # survived to here, say so loudly.

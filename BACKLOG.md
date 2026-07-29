@@ -251,18 +251,48 @@ Three things this says, in order of importance.
 3. **The straddle failing at p=0.019 is the control working.** A strategy set where nothing is
    permitted to lose would be a broken strategy set.
 
-### The gate is now the binding problem
+### The gate: FIXED 2026-07-29
 
-11 of 35 names were screened out, and most were rejected for REAL price moves rather than data
-errors: BMNR +694.8%, AMC +95.2%, NWBO -58.2%, GME -33.8%, and NFLX for its genuine
-2022-04-20 subscriber crash. The outlier check has no warning tier, so a legitimately violent
-small cap cannot pass. This is round one's "hard failures with no override" item arriving as a
-concrete 31% coverage loss, and it is now the highest-value fix: an acknowledged-exceptions
-list or a warning tier, so a real move is disclosed rather than disqualifying the name.
+Large moves are now CLASSIFIED rather than blanket-rejected, on the signature that separates a
+real move from a bad print:
 
-Cosmetic but misleading: the message reads "move(s) over 40%" then prints -35.1%. Both are
-correct (the threshold is on log returns, the display is simple) but the wording invites
-exactly the wrong conclusion.
+- **Reversion.** A real move persists; a bad print round-trips, because only one bar was wrong.
+  Undone to within 25% of itself inside 2 sessions -> hard failure.
+- **Volume.** Below 0.5x the trailing 60-day median means price moved violently while nobody
+  traded -> warn loudly, do not reject.
+- **Split-ratio match** stays a hard failure. ⚠️ An unapplied split is a ONE-WAY step and never
+  reverts, so the split verdict must ALSO populate `unexplained_outliers` or that field
+  silently stops meaning "this outlier is a data problem". Found only by writing the patch.
+- Everything else -> the new `warnings` tier, with `clean` keyed on failures only.
+- `acknowledged_events` lets a caller whitelist a known date instead of loosening a threshold.
+- Non-positive volume is now proportional (10% of bars). As a hard failure it made `assess`
+  unable to pass an index ticker at all (Yahoo reports 0 volume for ^GSPC, ^VIX) and killed
+  LOWLF on 276 legitimately untraded bars.
+- The message now states its basis: threshold in logs, display in simple returns.
+
+**Result: screened out 11 -> 5, full-window universe 19 -> 23.** Recovered NFLX, NWBO, AMC,
+SLNH into the full window plus BMNR and IREN as short-window. The 5 that remain are correctly
+rejected: GME and LOWLF for moves that genuinely round-trip, and RVI/SPCX/DRAM for having 39,
+0 and 20 usable bars.
+
+**And the headline finding got STRONGER, as predicted**, because the recovered names are
+volatile ones where capping upside costs most. Covered call mean ΔSharpe -0.043 -> **-0.062**,
+beating buy-and-hold on 9 of 23. Long straddle now the most significant loser at p=0.011.
+Every strategy still negative. Buy-and-hold's own mean Sharpe fell 0.414 -> 0.329, since the
+returning names are riskier.
+
+| strategy | beat | sign p | mean dSharpe | mean dReturn |
+|---|---|---|---|---|
+| protective put 5% | 10/23 | 0.678 | -0.039 | -47.5% |
+| covered call 0.25d | 9/23 | 0.405 | -0.062 | -61.6% |
+| collar 5/5 | 11/23 | 1.000 | -0.075 | -89.0% |
+| wheel 0.25d | 8/23 | 0.210 | -0.084 | -92.0% |
+| zero-cost collar | 11/23 | 1.000 | -0.089 | -93.5% |
+| cash-secured put | 7/23 | 0.093 | -0.093 | -100.0% |
+| bull call spread | 8/23 | 0.210 | -0.105 | -92.6% |
+| iron condor | 7/23 | 0.093 | -0.297 | -116.5% |
+| long straddle | 5/23 | **0.011** | -0.331 | -128.9% |
+| short strangle | 5/19 | 0.064 | -0.355 | -147.3% |
 
 ## Original batch scope, for reference
 
