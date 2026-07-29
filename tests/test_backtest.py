@@ -894,3 +894,98 @@ def test_mark_check_still_catches_a_material_error_on_a_cheap_option(monkeypatch
     corrupt.assert_identity()
     with pytest.raises(AssertionError, match="disagrees with an independent lattice"):
         corrupt.assert_marks()
+
+
+# ================== the last three round-one findings, each pinned by a repro ==================
+
+
+def test_fees_scale_with_contract_count():
+    """Charged per SPEC, one fee per leg, understated costs by the position size.
+
+    At 100 contracts over 35 rolls it billed 22.75 instead of 2275.00, a 100x error invisible
+    at unit size and appearing the moment anyone scales the notional.
+    """
+    close, sigma, rates, schedule = _world()
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule, ticker="S",
+              fee_per_contract=0.65)
+
+    one = run_backtest(
+        CoveredCall(shares=1.0, contracts=1.0, fully_collateralised=False), **kw
+    )
+    hundred = run_backtest(
+        CoveredCall(shares=100.0, contracts=100.0, fully_collateralised=False),
+        starting_equity=float(close.iloc[0]) * 100.0, **kw
+    )
+    one.assert_identity()
+    hundred.assert_identity()
+    assert hundred.fees_paid == pytest.approx(100.0 * one.fees_paid, rel=1e-9)
+    assert hundred.fees_paid == pytest.approx(0.65 * 100.0 * hundred.rolls, rel=1e-9)
+
+
+@pytest.mark.parametrize("series_name", ["close", "sigma", "rate"])
+def test_nan_inputs_are_rejected_at_the_door(series_name):
+    """A NaN does not fail loudly, it DISABLES the guards: every downstream check is a
+    comparison, and comparisons against NaN are False."""
+    close, sigma, rates, schedule = _world()
+    args = {"close": close.copy(), "sigma": sigma.copy(), "rate": rates.copy()}
+    args[series_name].iloc[400] = float("nan")
+    with pytest.raises(ValueError, match="NaN"):
+        run_backtest(CoveredCall(target_delta=0.25), schedule=schedule, ticker="S", **args)
+
+
+def test_assert_identity_rejects_a_nan_residual():
+    """pandas .max() is skipna=True, so `nan > tol` is False and an all-NaN residual PASSED.
+
+    One NaN in the rate series propagated through interest into cash, `summarise`'s dropna()
+    then amputated 17 months, and both the identity and verify() certified the result.
+    """
+    close, sigma, rates, schedule = _world()
+    result = run_backtest(
+        CoveredCall(target_delta=0.25), close, sigma, rates, schedule, ticker="S"
+    )
+    result.assert_identity()  # clean to start with
+
+    result.bars.loc[result.bars.index[500], "residual"] = float("nan")
+    with pytest.raises(AssertionError, match="NaN residual"):
+        result.assert_identity()
+
+
+@pytest.mark.parametrize("bad", [0.0, -50.0])
+def test_non_positive_starting_equity_is_refused(bad):
+    """The collateralisation guard reads `ctx.equity > 0` and keeps its stale share count when
+    that is false, so it fails OPEN. At starting_equity=0 the book held a full share against
+    cash of -101.02 and wrote a call against it, with the identity passing."""
+    close, sigma, rates, schedule = _world()
+    with pytest.raises(ValueError, match="starting_equity must be positive"):
+        run_backtest(
+            CoveredCall(target_delta=0.25), close, sigma, rates, schedule,
+            starting_equity=bad, ticker="S",
+        )
+
+
+def test_bar_zero_is_no_longer_exempt_from_the_identity():
+    """Bar 0's residual was hardcoded to zero, exempting initialisation from the only check in
+    the engine. Every bar-0 trade is value-neutral, so value must equal the opening equity
+    exactly, which is a real invariant rather than an assumption."""
+    close, sigma, rates, schedule = _world()
+    opening = float(close.iloc[0]) * 3.0
+    for strategy in (BuyHold(), CoveredCall(target_delta=0.25), ProtectivePut(strike_rule="moneyness", otm_pct=0.05)):
+        result = run_backtest(
+            strategy, close, sigma, rates, schedule,
+            starting_equity=opening, ticker="S",
+        )
+        assert result.bars["residual"].iloc[0] == pytest.approx(0.0, abs=1e-9)
+        assert result.value.iloc[0] == pytest.approx(opening, abs=1e-9)
+        result.assert_identity()
+
+
+def test_duplicate_index_is_refused():
+    """position_of_index keeps the LAST occurrence, so a duplicated expiry would settle at
+    time value instead of intrinsic and bank a mark above intrinsic."""
+    close, sigma, rates, schedule = _world()
+    dupe = close.index[100]
+    close2 = pd.concat([close, close.loc[[dupe]]]).sort_index()
+    sigma2 = pd.concat([sigma, sigma.loc[[dupe]]]).sort_index()
+    rates2 = pd.concat([rates, rates.loc[[dupe]]]).sort_index()
+    with pytest.raises(ValueError, match="duplicate dates"):
+        run_backtest(BuyHold(), close2, sigma2, rates2, schedule, ticker="S")

@@ -163,28 +163,32 @@ residual stays at floating-point noise, so the identity certifies a run that is 
 Measured on real WMT data: worst error 0.182% of premium on the covered call over 15 sampled
 bars, 0.938% on the protective put over 10, both immaterial against spot.
 
-## 7. Smaller, all with concrete repros
+## 7. Smaller, all with concrete repros — ALL FIXED 2026-07-29
 
-- **`fee_per_contract` is charged per spec, not per contract.** At `shares=100,
-  contracts=100`, 35 rolls charges 22.75 instead of 2275.00, a 100x understatement.
-  Hidden at unit size, appears the moment notional scales.
+- ✅ **`fee_per_contract` charged per spec, not per contract.** At `shares=100,
+  contracts=100`, 35 rolls billed 22.75 instead of 2275.00, a 100x understatement hidden at
+  unit size. Now multiplied by `abs(spec.quantity)`, with a test asserting a 100-contract run
+  costs exactly 100x a 1-contract run.
 - **`ProtectivePut` borrows to buy the put.** `target_shares` sweeps cash to zero, then
   `options_to_open` buys a put with money that no longer exists: min cash -2.11, negative
   on 85.3% of bars. The `NEG_CASH_TOL` guard is applied to `CoveredCall` only.
-- **`assert_identity` is blind to NaN.** `worst.max() > tol` uses pandas `skipna=True`, so
-  all-NaN yields `nan > tol == False`. One NaN in `rate` at bar 400 of 756 truncates
-  `summarise` by 17 months (via its `dropna`) and reports cum -36.25% / Sharpe -0.76
-  against a true -46.41% / -0.52, with `assert_identity` **and** `verify` both passing.
-- **`starting_equity <= 0` is accepted** and the collateralisation guard fails open:
-  `starting_equity=0.0` holds 1.0 share against cash of -101.02 and writes a call against
-  it, identity passing. Bar 0's residual is hardcoded to zero, which exempts
-  initialisation from the only check.
+- ✅ **`assert_identity` blind to NaN.** `worst.max() > tol` used pandas `skipna=True`, so an
+  all-NaN residual gave `nan > tol == False` and the documented last line of defence certified
+  the run. Now counts NaN residuals explicitly and raises, AND `run_backtest` rejects NaN in
+  close/sigma/rate at the door: a NaN does not fail loudly, it disables every guard, because
+  each one is a comparison and comparisons against NaN are False.
+- ✅ **`starting_equity <= 0` accepted, guard failing open.** The collateralisation guard reads
+  `ctx.equity > 0` and keeps its stale share count when false, so at `starting_equity=0` the
+  book held a full share against cash of -101.02 and wrote a call against it with the identity
+  passing. Now refused up front. **And bar 0 is no longer exempt from the identity:** its
+  residual was hardcoded to zero, which is what let that run through. Every bar-0 trade is
+  value-neutral, so `value == starting_equity` exactly, and that real invariant is now checked.
 - **`rolls` counts cycles where nothing was written.** At `sigma = 0` everywhere:
   `rolls=35`, `net_premium=0`, `max(open_positions)=0`.
-- **Non-unique index settles at time value, not intrinsic.** `position_of_index` keeps the
-  last occurrence, so a duplicated expiry row banks a time-value mark. One duplicated bar
-  moved terminal value by +0.055% with identity passing. Latent: the yfinance provider
-  dedupes, but the checker is provider-agnostic by design.
+- ✅ **Non-unique index settled at time value, not intrinsic.** `position_of_index` keeps the
+  last occurrence, so a duplicated expiry banked a time-value mark: one duplicated bar moved
+  terminal value +0.055% with the identity passing. `run_backtest` now refuses a duplicated
+  index outright, and `assess` detects duplicated rows independently.
 - **The adjustment check's power is proportional to dividend yield.** `tol = 2e-3` on a
   per-ex-date return means a detection floor near 0.8% annualised, so a dropped or
   day-shifted dividend passes as consistent for AAPL, GOOGL, META, MA, NVDA. Also
@@ -378,3 +382,24 @@ disclosed rather than silently corrected.
 
 Budget if retried: roughly 60-120 calls per ticker across five years, cached aggressively,
 and expect to discard a large fraction of the bars.
+
+---
+
+## Status 2026-07-29: every review finding is closed
+
+Three adversarial review agents produced 6 + 13 + 14 findings across the options/accounting
+core, the data layer, and the statistics. All are now fixed or explicitly retracted, with a
+named test per fix. 419 tests.
+
+The two that changed conclusions rather than just code:
+- The **dividend-policy mismatch** and the **q=0 pricing** together had inflated WMT's covered
+  call. Its edge over buy-and-hold fell from 13.1pp to 1.34pp and Sharpe from 1.02 to 0.996.
+- The **batch** then showed no strategy beats buy-and-hold across 23 names, with the ordering
+  following exactly what a zero variance risk premium predicts. That reframed WMT from a
+  finding into a favourable single case.
+
+The recurring lesson, worth more than any individual fix: **a check that cannot fail is worse
+than no check**, because it is read as evidence. Four separate instances of it turned up here.
+The telescoping `verify()`. The split cross-reference that was only a comment. `assert_identity`
+skipping NaN. And the accounting identity itself, which is real but cannot police the marks it
+is computed from, since booking and marking at the same price nets to zero for any price.

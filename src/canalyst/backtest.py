@@ -142,7 +142,19 @@ class BacktestResult:
 
     def assert_identity(self, tol: float = IDENTITY_TOL) -> None:
         """Raise unless every bar's value change is fully explained."""
-        worst = self.bars["residual"].abs()
+        residual = self.bars["residual"]
+        # pandas .max() is skipna=True, so an all-NaN residual yields nan, and `nan > tol` is
+        # False. The documented last line of defence silently certified any run whose ledger
+        # had gone NaN: one NaN in the rate series propagated through interest into cash, and
+        # `summarise`'s dropna() then amputated 17 months while both checks passed.
+        missing = int(residual.isna().sum())
+        if missing:
+            first = residual.index[residual.isna()][0]
+            raise AssertionError(
+                f"{missing} bar(s) have a NaN residual, first {first:%Y-%m-%d}. A NaN cannot "
+                "be compared against a tolerance, so the identity cannot vouch for this run."
+            )
+        worst = residual.abs()
         if worst.max() > tol:
             day = worst.idxmax()
             row = self.bars.loc[day]
@@ -227,6 +239,19 @@ def run_backtest(
         raise ValueError("sigma index does not match close index")
     if not index.equals(pd.DatetimeIndex(rate.index)):
         raise ValueError("rate index does not match close index")
+    # Reject NaN at the door. Every downstream check is comparison-based, and comparisons
+    # against NaN are False, so a NaN input does not fail loudly, it disables the guards.
+    for label, series in (("close", close), ("sigma", sigma), ("rate", rate)):
+        bad = int(pd.Series(series).isna().sum())
+        if bad:
+            raise ValueError(
+                f"{label} contains {bad} NaN value(s); refusing to run. A NaN propagates "
+                "silently through the ledger and turns every tolerance check into a pass."
+            )
+    if index.has_duplicates:
+        # position_of_index keeps the last occurrence, so a duplicated expiry would settle at
+        # time value instead of intrinsic.
+        raise ValueError("close index contains duplicate dates")
 
     dividends = (
         pd.Series(0.0, index=index) if dividends is None else dividends.reindex(index).fillna(0.0)
@@ -246,10 +271,20 @@ def run_backtest(
     stride = max(1, len(index) // max(verify_marks, 1)) if verify_marks > 0 else 0
     mark_checks: list[dict] = []
 
-    shares = 0.0
-    cash = (
+    opening_equity = (
         float(starting_equity) if starting_equity is not None else float(close.iloc[0])
     )
+    if not opening_equity > 0:
+        # The collateralisation guard reads `ctx.equity > 0` and keeps its stale share count
+        # when that is false, so it fails OPEN: at starting_equity=0 the book held a full
+        # share against cash of -101.02 and wrote a call against it, identity passing.
+        raise ValueError(
+            f"starting_equity must be positive, got {opening_equity!r}. A non-positive "
+            "opening balance makes the collateralisation guard fail open into leverage."
+        )
+
+    shares = 0.0
+    cash = opening_equity
     book: list[OpenPosition] = []
 
     prev_value: float | None = None
@@ -374,7 +409,11 @@ def run_backtest(
             cash -= mark  # short position: mark is negative, so cash rises
             net_premium += -mark
             book.append(OpenPosition(spec=spec, opened_on=day, last_mark=mark))
-            fees_today += fee_per_contract
+            # Per CONTRACT, not per spec. Charging once per leg understated costs by the
+            # position size: at 100 contracts over 35 rolls it billed 22.75 instead of
+            # 2275.00, a 100x error invisible at unit size and appearing the moment anyone
+            # scales the notional.
+            fees_today += fee_per_contract * abs(spec.quantity)
         if fees_today:
             cash -= fees_today
             fees_paid += fees_today
@@ -386,8 +425,13 @@ def run_backtest(
         value = shares * spot + cash + option_mtm
 
         if prev_value is None:
+            # Bar 0 used to hardcode a zero residual, which exempted initialisation from the
+            # only check in the engine and is what let a non-positive opening balance run at
+            # infinite leverage unnoticed. Every bar-0 trade is value-neutral (shares bought
+            # at spot, options opened at fair value), so value must still equal the opening
+            # equity exactly. That is a real invariant, so check it.
             d_value = np.nan
-            residual = 0.0
+            residual = value - opening_equity
         else:
             d_value = value - prev_value
             explained = (
