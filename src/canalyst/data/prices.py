@@ -134,6 +134,11 @@ def _write_cache(
                 "last": str(history.frame.index[-1].date()),
                 "requested_start": str(pd.Timestamp(requested_start).date()),
                 "requested_end": str(pd.Timestamp(requested_end).date()),
+                # The actual extent, so a caller can tell "we asked for five years and
+                # this ticker only has two" from "the cache is narrow". The coverage
+                # check below is metadata-only and cannot distinguish those on its own.
+                "data_first": str(history.frame.index[0].date()),
+                "data_last": str(history.frame.index[-1].date()),
             },
             indent=2,
         )
@@ -245,6 +250,13 @@ def load_history(
             f"provider {provider.name!r} returned no history for {ticker!r} "
             f"over {start}..{end}"
         )
+    # Drop the in-progress bar BEFORE writing. Writing first persists the partial bar,
+    # and because a 12h TTL outlives a 6.5h session (or a 3.5h half day), the next read
+    # after the bell finds `last_completed_session` advanced past it and no longer drops
+    # it. The mid-session snapshot then becomes that session's official close. Observed
+    # live: an AAPL bar cached at 13:09 ET carried 21.4M volume against 51.7M for the
+    # completed prior session.
+    trimmed = drop_incomplete_bar(fetched) if drop_incomplete else fetched
     if use_cache:
-        _write_cache(cache_dir, fetched, start, end)
-    return drop_incomplete_bar(fetched) if drop_incomplete else fetched
+        _write_cache(cache_dir, trimmed, start, end)
+    return trimmed

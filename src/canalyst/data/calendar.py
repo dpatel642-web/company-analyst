@@ -78,7 +78,9 @@ def third_fridays(
 
 
 def align_to_session(
-    targets: pd.DatetimeIndex, trading_sessions: pd.DatetimeIndex
+    targets: pd.DatetimeIndex,
+    trading_sessions: pd.DatetimeIndex,
+    calendar: str = DEFAULT_CALENDAR,
 ) -> pd.DatetimeIndex:
     """Snap each target date back to the last session on or before it.
 
@@ -98,12 +100,24 @@ def align_to_session(
     out: list[pd.Timestamp] = []
     seen: set[pd.Timestamp] = set()
     for target in _naive(targets):
-        if target > sessions_sorted[-1]:
-            continue  # target postdates all known sessions
+        # Bound on the SNAPPED session, not the raw target. Testing the unsnapped third
+        # Friday discards a holiday-shifted expiry that is genuinely present: with data
+        # ending 2025-04-17, the 04-18 Good Friday target reads as out of range even
+        # though 04-17 IS that month's expiry and IS the last bar. All six
+        # holiday-shifted expiries in 2008-2026 failed this way.
         loc = sessions_sorted.searchsorted(target, side="right")
         if loc == 0:
             continue  # target predates all known sessions
         session = sessions_sorted[loc - 1]
+        # A target beyond the data snaps to the final bar, which would invent an expiry
+        # on whatever that bar happens to be. Only keep it when the target is genuinely
+        # within reach of a real session: either the target IS a session, or the snapped
+        # session is the calendar-correct predecessor (a holiday shift), which means the
+        # gap between them contains no sessions at all.
+        if target > sessions_sorted[-1] and target not in sessions_sorted:
+            gap = sessions(session, target, calendar=calendar)
+            if len(gap) > 1 or (target - session).days > 4:
+                continue
         if session not in seen:
             out.append(session)
             seen.add(session)
@@ -119,7 +133,7 @@ def monthly_expiries(
     if len(sessions_sorted) == 0:
         return pd.DatetimeIndex([])
     fridays = third_fridays(sessions_sorted[0], sessions_sorted[-1])
-    aligned = align_to_session(fridays, sessions_sorted)
+    aligned = align_to_session(fridays, sessions_sorted, calendar=calendar)
     return aligned[(aligned >= sessions_sorted[0]) & (aligned <= sessions_sorted[-1])]
 
 

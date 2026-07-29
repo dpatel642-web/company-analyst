@@ -1,10 +1,25 @@
-"""Performance statistics, each computed two independent ways.
+"""Performance statistics, with an honest account of which checks actually check anything.
 
-House rule: a number worth acting on gets verified by a second path. Applied here that
-means cumulative return from terminal-over-initial *and* from compounded daily returns,
-and Sharpe from daily *and* from monthly sampling. The two paths use different
-arithmetic, so agreement is evidence and disagreement is a bug. Both are reported and
-the gap is printed rather than hidden behind whichever looked nicer.
+House rule is that a number worth acting on gets verified by a second path. That rule is
+easy to satisfy in appearance and hard to satisfy in substance, so this module labels
+which of its checks are real.
+
+REAL: Sharpe from daily and from monthly sampling. Different estimators over different
+samples, so a disagreement is informative. (They coincide exactly only under iid
+returns, which is an assumption, not a fact.)
+
+REAL, and living in backtest.py rather than here: the daily accounting identity. That is
+the check with actual detection power over a corrupted equity curve.
+
+NOT REAL, and previously mislabelled here as independent evidence:
+`cumulative_return_check`. It computes `expm1(sum(log1p(pct_change)))`, and
+`log1p(v_i/v_{i-1} - 1) == log(v_i) - log(v_{i-1})`, so the sum **telescopes** to
+`log(v_n/v_0)` and the result is algebraically identical to `v_n/v_0 - 1`. Agreement to
+1e-16 is float rounding on a telescoping sum, not corroboration. Verified to have zero
+detection power: inject a fabricated 50% jump mid-curve and it still agrees to 3e-15.
+It is retained purely as a float-stability tripwire and is documented as such. No metric
+computed *from* an equity curve can detect that the curve itself is wrong; that has to be
+caught upstream.
 
 On Sharpe specifically. The textbook definition is the mean excess return over its
 standard deviation, annualised by the square root of the sampling frequency. The handout
@@ -12,6 +27,13 @@ instead divides a geometrically-compounded annual return by an arithmetically-an
 volatility, which mixes two conventions. That is not a rounding difference: on a
 high-volatility name the two disagree materially, because compounding drags the
 geometric return well below the arithmetic mean. Both are reported here, labelled.
+
+On Sortino. The denominator is target downside deviation,
+`sqrt(mean over ALL periods of min(r - MAR, 0)^2)` with MAR = the risk-free rate. It is
+NOT the standard deviation of the negative subset, which is a common shortcut and a wrong
+one: dividing by `n_neg` instead of `n` and demeaning about the subset mean instead of
+about the target makes the bias a function of the hit rate, so it flips sign as drift
+changes and silently reorders a strategy comparison.
 """
 
 from __future__ import annotations
@@ -23,6 +45,8 @@ import pandas as pd
 
 TRADING_DAYS = 252
 MONTHS = 12
+#: Below this, annualisation is arithmetically valid and substantively meaningless.
+MIN_YEARS_FOR_ANNUALISATION = 0.25
 
 
 def daily_simple_rf(rf_continuous: pd.Series) -> pd.Series:
@@ -36,6 +60,7 @@ class Performance:
     start: pd.Timestamp
     end: pd.Timestamp
     years: float
+    elapsed_years: float
 
     cumulative_return: float
     cumulative_return_check: float
@@ -58,20 +83,32 @@ class Performance:
 
     @property
     def cumulative_return_gap(self) -> float:
-        """Absolute difference between the two independent computations."""
+        """Float-stability residual on a telescoping sum. NOT independent corroboration.
+
+        See the module docstring: the two expressions are algebraically identical, so this
+        can only ever detect floating-point pathology, never a wrong equity curve.
+        """
         return abs(self.cumulative_return - self.cumulative_return_check)
 
     @property
     def sharpe_gap(self) -> float:
+        """Daily vs monthly Sharpe. This one IS a real check."""
         return abs(self.sharpe_daily - self.sharpe_monthly)
 
     def verify(self, tol: float = 1e-9) -> None:
-        """Raise if the two cumulative-return paths disagree beyond floating noise."""
+        """Raise on floating-point pathology in the cumulative-return arithmetic.
+
+        Deliberately narrow. This used to be presented as verifying the return itself,
+        which it cannot do. Real verification of an equity curve is
+        `BacktestResult.assert_identity`; real verification of the risk-adjusted numbers
+        is the daily-vs-monthly Sharpe pair.
+        """
         if self.cumulative_return_gap > tol:
             raise AssertionError(
-                f"{self.label}: cumulative return disagrees between methods "
+                f"{self.label}: cumulative return arithmetic is numerically unstable "
                 f"({self.cumulative_return:.6%} vs {self.cumulative_return_check:.6%}, "
-                f"gap {self.cumulative_return_gap:.2e})"
+                f"gap {self.cumulative_return_gap:.2e}). Note this is a float-stability "
+                f"check only; it cannot detect a wrong input curve."
             )
 
     def render(self) -> str:
@@ -79,10 +116,8 @@ class Performance:
             [
                 f"{self.label}",
                 f"  window                 {self.start:%Y-%m-%d} .. {self.end:%Y-%m-%d} "
-                f"({self.years:.2f}y)",
-                f"  cumulative return      {self.cumulative_return:>9.2%}   "
-                f"(cross-check {self.cumulative_return_check:.2%}, "
-                f"gap {self.cumulative_return_gap:.1e})",
+                f"({self.years:.2f}y by bar count, {self.elapsed_years:.2f}y elapsed)",
+                f"  cumulative return      {self.cumulative_return:>9.2%}",
                 f"  CAGR                   {self.cagr:>9.2%}",
                 f"  arithmetic annual      {self.arithmetic_annual_return:>9.2%}",
                 f"  annualised volatility  {self.annual_vol:>9.2%}",
@@ -90,7 +125,8 @@ class Performance:
                 f"  Sharpe (monthly)       {self.sharpe_monthly:>9.2f}   "
                 f"(gap {self.sharpe_gap:.2f})",
                 f"  Sharpe (handout conv.) {self.sharpe_handout_convention:>9.2f}",
-                f"  Sortino                {self.sortino:>9.2f}",
+                f"  Sortino                {self.sortino:>9.2f}   "
+                f"(target downside deviation, MAR = rf)",
                 f"  max drawdown           {self.max_drawdown:>9.2%}   "
                 f"on {self.max_drawdown_date:%Y-%m-%d}",
                 f"  best / worst day       {self.best_day:>9.2%} / {self.worst_day:.2%}",
@@ -119,6 +155,15 @@ def summarise(
     ret = value.pct_change().dropna()
     n = len(ret)
     years = n / TRADING_DAYS
+    # Annualising a handful of bars produces numbers that are arithmetically correct and
+    # completely meaningless: three observations rising 10% annualise to a CAGR of
+    # 16,423,877%. Refuse rather than emit it.
+    if years < MIN_YEARS_FOR_ANNUALISATION:
+        raise ValueError(
+            f"{label}: {n} return observations is {years:.4f} years, too short to "
+            f"annualise (minimum {MIN_YEARS_FOR_ANNUALISATION}). CAGR and Sharpe would "
+            f"be arithmetically valid and substantively meaningless."
+        )
 
     # --- cumulative return, two independent ways
     cumulative = value.iloc[-1] / value.iloc[0] - 1.0
@@ -161,15 +206,24 @@ def summarise(
         (arithmetic_annual - mean_rf) / annual_vol if annual_vol > 0 else np.nan
     )
 
-    downside = excess[excess < 0]
-    downside_vol = (
-        float(downside.std(ddof=1) * np.sqrt(TRADING_DAYS)) if len(downside) > 1 else np.nan
-    )
+    # Target downside deviation: deviations below the target (excess return of zero,
+    # i.e. MAR = the risk-free rate), squared, averaged over ALL periods, not just the
+    # losing ones. Using the negative subset's stdev instead makes the bias a function of
+    # the hit rate: measured on synthetic paths it ranges from 1.49x (overstating, at a
+    # 69% loss rate) to 0.61x (understating, at 17%), which silently reorders any
+    # cross-strategy comparison.
+    shortfall = excess.clip(upper=0.0)
+    downside_vol = float(np.sqrt((shortfall**2).mean()) * np.sqrt(TRADING_DAYS))
     sortino = (
         float(excess.mean() * TRADING_DAYS / downside_vol)
-        if downside_vol and downside_vol > 0
+        if downside_vol > 0
         else np.nan
     )
+
+    # Elapsed calendar time, reported alongside the return-count basis. `years = n/252`
+    # silently overstates CAGR for any series with missing sessions, and a reader seeing
+    # "4.97y" next to a date range will assume calendar.
+    elapsed_years = (value.index[-1] - value.index[0]).days / 365.25
 
     drawdown = value / value.cummax() - 1.0
     calendar = (1.0 + ret).groupby(ret.index.year).prod() - 1.0
@@ -180,6 +234,7 @@ def summarise(
         start=value.index[0],
         end=value.index[-1],
         years=years,
+        elapsed_years=elapsed_years,
         cumulative_return=float(cumulative),
         cumulative_return_check=cumulative_check,
         cagr=float(cagr),

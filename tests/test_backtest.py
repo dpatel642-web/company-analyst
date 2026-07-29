@@ -280,20 +280,84 @@ def test_pricing_vol_markup_increases_premium_collected():
     assert marked.net_premium > base.net_premium
 
 
-def test_interest_accrues_on_cash_and_matters():
-    """Extra starting equity leaves idle cash, which must earn the prevailing rate."""
+def test_interest_accrues_on_idle_cash():
+    """Idle cash must earn the prevailing rate.
+
+    Requires `fully_invested=False`: the default benchmark sweeps cash into stock on
+    every bar, so by construction it holds no idle cash to earn anything. That sweep is
+    deliberate (it is what makes the benchmark comparable to the collateralised
+    overlays), which means interest has to be tested on a strategy that does hold cash.
+    """
     close, sigma, rates, schedule = _world(drift=0.0)
-    idle = float(close.iloc[0]) * 3.0  # well above one share, so cash stays positive
-    at_zero = run_backtest(
-        BuyHold(), close, sigma, pd.Series(0.0, index=close.index), schedule,
+    idle = float(close.iloc[0]) * 3.0  # funds one share and leaves 2x sitting in cash
+    kw = dict(
+        close=close, sigma=sigma, schedule=schedule,
         starting_equity=idle, ticker="S",
     )
+    at_zero = run_backtest(
+        BuyHold(fully_invested=False), rate=pd.Series(0.0, index=close.index), **kw
+    )
     at_five = run_backtest(
-        BuyHold(), close, sigma, pd.Series(0.05, index=close.index), schedule,
-        starting_equity=idle, ticker="S",
+        BuyHold(fully_invested=False), rate=pd.Series(0.05, index=close.index), **kw
     )
     assert at_five.bars["interest"].sum() > at_zero.bars["interest"].sum()
     assert at_zero.bars["interest"].sum() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_fully_invested_benchmark_holds_no_idle_cash():
+    """The fix for the dividend-policy mismatch: the benchmark must sweep cash to stock.
+
+    A constant-one-share benchmark leaves dividends idle while the collateralised
+    overlays compound theirs into stock, so the comparison silently measures dividend
+    policy. Measured on a PG-like path that mismatch was worth 7.26 percentage points,
+    all of it flattering the overlay.
+    """
+    close, sigma, rates, schedule = _world()
+    dividends = pd.Series(0.0, index=close.index)
+    for day in close.index[::63]:
+        dividends.loc[day] = 0.85
+
+    swept = run_backtest(
+        BuyHold(), close, sigma, rates, schedule, dividends=dividends, ticker="S"
+    )
+    idle = run_backtest(
+        BuyHold(fully_invested=False), close, sigma, rates, schedule,
+        dividends=dividends, ticker="S",
+    )
+    swept.assert_identity()
+    idle.assert_identity()
+
+    assert abs(swept.bars["cash"].iloc[-1]) < 1e-9, "fully invested means no idle cash"
+    assert idle.bars["cash"].iloc[-1] > 1.0, "the old convention parks dividends in cash"
+    assert swept.bars["shares"].iloc[-1] > 1.0, "dividends must compound into stock"
+    assert idle.bars["shares"].iloc[-1] == pytest.approx(1.0)
+    # And the convention alone changes the benchmark, which is the whole problem.
+    assert swept.value.iloc[-1] != pytest.approx(idle.value.iloc[-1], rel=1e-6)
+
+
+def test_zero_vol_collapse_still_holds_with_dividends():
+    """The collapse test that did not exist, and that the mismatch was breaking.
+
+    At zero pricing vol a written call is worth exactly intrinsic, so a covered call is
+    economically identical to buy-and-hold. Without matched dividend policy this broke by
+    12.3% of initial capital in the overlay's favour while the accounting identity passed,
+    which meant the test was measuring dividend policy rather than options.
+    """
+    close, _, rates, schedule = _world()
+    zero_vol = pd.Series(0.0, index=close.index)
+    dividends = pd.Series(0.0, index=close.index)
+    for day in close.index[::63]:
+        dividends.loc[day] = 0.85
+
+    kw = dict(
+        close=close, sigma=zero_vol, rate=rates, schedule=schedule,
+        dividends=dividends, ticker="S",
+    )
+    overlay = run_backtest(CoveredCall(strike_rule="moneyness", otm_pct=0.05), **kw)
+    benchmark = run_backtest(BuyHold(), **kw)
+    pd.testing.assert_series_equal(
+        overlay.value, benchmark.value, check_names=False, rtol=0, atol=1e-8
+    )
 
 
 # ---------------------------------------------------- the handout's bugs, reproduced
