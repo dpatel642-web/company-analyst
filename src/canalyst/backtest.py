@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 
 from .options.bs import bs_price
+from .options.crosscheck import crr_price
 from .options.vol import trailing_dividend_yield
 from .strategies.base import BarContext, OpenPosition, OptionSpec, Strategy
 
@@ -53,6 +54,24 @@ TRADING_DAYS = 252
 #: Residual tolerance per bar, in currency units. Floating point noise on values of
 #: order 1e3 lands far below this; a real leak lands far above.
 IDENTITY_TOL = 1e-7
+#: Lattice steps for the independent mark check. Enough for sub-percent agreement with the
+#: closed form without making the check too slow to leave switched on.
+MARK_CHECK_STEPS = 600
+#: Relative tolerance between the closed-form mark and the lattice. Generous on purpose: it
+#: needs to pass ordinary discretisation error and fail a genuinely wrong input. A mark
+#: carrying no theta is off by tens of percent, so 1% is not a close call.
+MARK_CHECK_TOL = 0.01
+#: Below this premium the relative comparison is meaningless, so the bar is skipped.
+MARK_CHECK_MIN_PREMIUM = 1e-4
+#: A mark error must ALSO be material against spot before it counts as a failure.
+#:
+#: Relative-to-premium alone produces false positives: a cheap out-of-the-money put carries a
+#: small premium, so ordinary lattice discretisation error is a large FRACTION of it while
+#: being economically irrelevant. Measured on real WMT data the protective put reached 0.938%
+#: of premium, nearly tripping a 1% tolerance on nothing but discretisation. Two basis points
+#: of spot is well below anything that moves an equity curve, and far below the tens of percent
+#: a genuinely wrong mark produces.
+MARK_CHECK_SPOT_TOL = 0.0002
 
 
 @dataclass
@@ -65,6 +84,8 @@ class BacktestResult:
     assignments: int
     #: Net cash received for options written, less cash paid for options bought.
     net_premium: float = 0.0
+    #: Sampled interim marks repriced against an independent lattice. See `assert_marks`.
+    mark_checks: list[dict] = field(default_factory=list)
     settings: dict = field(default_factory=dict)
 
     @property
@@ -74,6 +95,50 @@ class BacktestResult:
     @property
     def max_abs_residual(self) -> float:
         return float(self.bars["residual"].abs().max())
+
+    def assert_marks(self, tol: float = MARK_CHECK_TOL) -> None:
+        """Raise if any sampled interim mark disagrees with an independent lattice price.
+
+        WHY THIS EXISTS, AND WHY THE IDENTITY CANNOT REPLACE IT
+
+        The accounting identity is a TELESCOPING sum. Over a position's life
+        `sum(mark_t - mark_{t-1})` collapses to `mark_settle - mark_open`, so every interim
+        mark cancels out. A wrong interim time-to-expiry therefore changes the daily return
+        path, volatility, Sharpe and drawdown while leaving terminal value bit-identical and
+        every residual at 1e-13.
+
+        That is not hypothetical. Four mutants touching only the interim marking line were run
+        against the 27 load-bearing assertions in the suite. An interim mark carrying ZERO
+        THETA, no time decay at all, failed 0 of 27 while moving Sharpe by 0.024 and annualised
+        volatility by 1.3 percentage points. The identity is a closure check on the ledger,
+        evaluated with the model's own marks on both sides of every trade, so booking at price
+        `p` and marking at the same `p` nets to zero for ANY `p`.
+
+        This check pins the mark LEVEL instead, by repricing sampled positions with a
+        Cox-Ross-Rubinstein lattice. The lattice shares no arithmetic with the closed form, so
+        it also catches a wrong pricing argument, including a missing dividend yield.
+        """
+        if not self.mark_checks:
+            return
+        # Both conditions: a large fraction of a negligible premium is not a real problem.
+        bad = [
+            c for c in self.mark_checks
+            if c["relative_error"] > tol and c["spot_error"] > MARK_CHECK_SPOT_TOL
+        ]
+        if bad:
+            worst = max(bad, key=lambda c: c["spot_error"])
+            raise AssertionError(
+                f"interim mark disagrees with an independent lattice on "
+                f"{len(bad)} of {len(self.mark_checks)} sampled bars. Worst on "
+                f"{worst['date']:%Y-%m-%d}: closed form {worst['analytic']:.6f} vs lattice "
+                f"{worst['lattice']:.6f}, relative error {worst['relative_error']:.4%} "
+                f"(tolerance {tol:.2%}). The accounting identity cannot see this, because "
+                f"interim marks telescope out of it."
+            )
+
+    @property
+    def worst_mark_error(self) -> float:
+        return max((c["relative_error"] for c in self.mark_checks), default=0.0)
 
     def assert_identity(self, tol: float = IDENTITY_TOL) -> None:
         """Raise unless every bar's value change is fully explained."""
@@ -123,6 +188,7 @@ def run_backtest(
     div_yield: pd.Series | None = None,
     starting_equity: float | None = None,
     fee_per_contract: float = 0.0,
+    verify_marks: int = 0,
     ticker: str = "",
     settings: dict | None = None,
 ) -> BacktestResult:
@@ -147,6 +213,12 @@ def run_backtest(
 
     `starting_equity` is the capital the portfolio begins with, defaulting to one share's
     price so the curve starts level with buy-and-hold and returns are directly comparable.
+
+    `verify_marks` samples that many interim bars and reprices every open position with an
+    independent lattice, checked via `BacktestResult.assert_marks`. Off by default because it
+    is roughly ten times the cost of a plain run, and a check that taxes every call is a check
+    people switch off. Every real analysis path turns it on; see `assert_marks` for why the
+    accounting identity cannot substitute for it.
     """
     index = pd.DatetimeIndex(close.index)
     if len(index) == 0:
@@ -167,6 +239,12 @@ def run_backtest(
     expiry_by_roll = schedule["expiry"].to_dict() if len(schedule) else {}
     position_of_index = {d: i for i, d in enumerate(index)}
     dt = 1.0 / TRADING_DAYS
+
+    # Bars on which to independently reprice open positions. Spread across the run rather
+    # than clustered, and interim only: the open and expiry bars are already pinned by the
+    # identity, so checking them would prove nothing about the marks in between.
+    stride = max(1, len(index) // max(verify_marks, 1)) if verify_marks > 0 else 0
+    mark_checks: list[dict] = []
 
     shares = 0.0
     cash = (
@@ -208,6 +286,20 @@ def run_backtest(
             mark = _mark(
                 pos.kind, pos.strike, spot, years, r, vol, pos.quantity, div_yield=q
             )
+            if (
+                stride
+                and i % stride == 0
+                and years > 0.0
+                and pos.opened_on < day
+                and abs(mark) > MARK_CHECK_MIN_PREMIUM
+            ):
+                mark_checks.append(
+                    {
+                        "date": day, "kind": pos.kind, "strike": pos.strike, "spot": spot,
+                        "years": years, "rate": r, "sigma": vol, "div_yield": q,
+                        "quantity": pos.quantity, "analytic": mark,
+                    }
+                )
             option_mtm_change += mark - pos.last_mark
             marked.append(
                 OpenPosition(spec=pos.spec, opened_on=pos.opened_on, last_mark=mark)
@@ -327,6 +419,22 @@ def run_backtest(
         prev_value = value
         prev_spot = spot
 
+    # Reprice the sampled marks with a lattice. Done after the loop so the cost never sits
+    # inside the hot path, and so a slow check cannot distort anything it is measuring.
+    for check in mark_checks:
+        lattice = crr_price(
+            check["spot"], check["strike"], check["years"], check["rate"],
+            max(check["sigma"], 1e-9), check["kind"], q=check["div_yield"],
+            steps=MARK_CHECK_STEPS,
+        ) * check["quantity"]
+        check["lattice"] = lattice
+        gap = abs(check["analytic"] - lattice)
+        scale = max(abs(check["analytic"]), abs(lattice), MARK_CHECK_MIN_PREMIUM)
+        check["relative_error"] = gap / scale
+        # Also express it against spot, so a large fraction of a tiny premium is not mistaken
+        # for an error that matters to the portfolio.
+        check["spot_error"] = gap / max(check["spot"], MARK_CHECK_MIN_PREMIUM)
+
     bars = pd.DataFrame(rows).set_index("date")
     return BacktestResult(
         strategy=strategy.name,
@@ -334,6 +442,7 @@ def run_backtest(
         bars=bars,
         fees_paid=fees_paid,
         net_premium=net_premium,
+        mark_checks=mark_checks,
         rolls=rolls,
         assignments=assignments,
         settings=settings or {},

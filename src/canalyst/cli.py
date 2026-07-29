@@ -84,12 +84,14 @@ def _evaluate(
     common = dict(
         close=close, sigma=apply_markup(realised, markup), rate=rf,
         schedule=schedule, dividends=dividends, ticker=ticker,
+        verify_marks=12,  # independent lattice check; the identity cannot see interim marks
     )
 
     benchmark = run_backtest(BuyHold(), **common)
     overlay = run_backtest(CoveredCall(target_delta=delta), **common)
-    benchmark.assert_identity()
-    overlay.assert_identity()
+    for result in (benchmark, overlay):
+        result.assert_identity()
+        result.assert_marks()
 
     bh: Performance = summarise(benchmark.value, rf, label="bh")
     cc: Performance = summarise(overlay.value, rf, label="cc")
@@ -125,11 +127,13 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     common = dict(
         close=close, sigma=apply_markup(realised, args.iv_markup), rate=rf,
         schedule=schedule, dividends=dividends, ticker=args.ticker.upper(),
+        verify_marks=12,
     )
     benchmark = run_backtest(BuyHold(), **common)
     overlay = run_backtest(CoveredCall(target_delta=args.delta), **common)
-    benchmark.assert_identity()
-    overlay.assert_identity()
+    for result in (benchmark, overlay):
+        result.assert_identity()
+        result.assert_marks()
 
     for label, result in [("buy and hold", benchmark), ("covered call", overlay)]:
         perf = summarise(result.value, rf, label=label)

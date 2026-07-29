@@ -716,3 +716,181 @@ def test_dividend_yield_is_capped_so_strike_inversion_stays_solvable():
     assert q.max() <= np.log1p(0.25) + 1e-12
     # And it is still usable for strike selection.
     strike_from_delta(10.0, 21 / 252, 0.04, 0.30, 0.25, "call", q=float(q.max()))
+
+
+# ============ the interim mark check: what the telescoping identity cannot see ============
+#
+# The identity is a closure check on the ledger. Over a position's life
+# sum(mark_t - mark_{t-1}) collapses to mark_settle - mark_open, so every interim mark cancels
+# out of it. An adversarial review built four mutants touching ONLY the interim marking line
+# and ran them against the 27 load-bearing assertions in this file. An interim mark carrying
+# zero theta failed 0 of 27, while moving Sharpe by 0.024 and annualised vol by 1.3pp.
+#
+# These tests reproduce that and show the lattice check catches what the identity structurally
+# cannot.
+
+
+def _mutant_mark(variant: str):
+    """Return a replacement for backtest._mark that corrupts ONLY the interim time to expiry."""
+    from canalyst.options.bs import bs_price
+
+    def frozen(kind, strike, spot, years, rate, sigma, quantity, div_yield=0.0):
+        # No time decay at all: the option is marked as if it never aged.
+        return quantity * bs_price(
+            spot, strike, max(21 / 252, 0.0), rate, max(sigma, 0.0), kind, q=div_yield
+        )
+
+    def wrong_daycount(kind, strike, spot, years, rate, sigma, quantity, div_yield=0.0):
+        # 365 instead of 252: T is off by a factor of 0.69, so price is off by ~17%.
+        return quantity * bs_price(
+            spot, strike, max(years * 252 / 365, 0.0), rate, max(sigma, 0.0), kind,
+            q=div_yield,
+        )
+
+    return {"frozen": frozen, "wrong_daycount": wrong_daycount}[variant]
+
+
+@pytest.mark.parametrize("variant", ["frozen", "wrong_daycount"])
+def test_lattice_check_catches_a_corrupt_interim_mark(monkeypatch, variant):
+    """The load-bearing test. A wrong interim mark must be caught by SOMETHING."""
+    import canalyst.backtest as engine
+
+    close, sigma, rates, schedule = _world()
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule, ticker="S",
+              verify_marks=16)
+
+    monkeypatch.setattr(engine, "_mark", _mutant_mark(variant))
+    corrupt = run_backtest(CoveredCall(target_delta=0.25), **kw)
+
+    # The identity still passes: the corruption telescopes out of it entirely.
+    corrupt.assert_identity()
+    # The lattice check does not.
+    with pytest.raises(AssertionError, match="disagrees with an independent lattice"):
+        corrupt.assert_marks()
+    assert corrupt.worst_mark_error > 0.05, corrupt.worst_mark_error
+
+
+@pytest.mark.parametrize("variant", ["frozen", "wrong_daycount"])
+def test_the_identity_alone_cannot_see_a_corrupt_interim_mark(monkeypatch, variant):
+    """Pin the gap itself, so nobody concludes the identity is sufficient.
+
+    Scope note, because it matters for what this proves. Patching `_mark` corrupts every
+    pricing call, including the opening and the settlement, so terminal value moves here too.
+    The adversarial review's mutants were surgical, touching only the interim marking line, and
+    those left terminal value BIT-IDENTICAL while shifting Sharpe by 0.024 and annualised
+    volatility by 1.3pp. Reproducing that surgically would need a test-only seam in production
+    code, which is a worse trade than stating the scope.
+
+    Either way the load-bearing claim holds and is what this asserts: the residual stays at
+    floating-point noise, so the accounting identity certifies a run whose marks are wrong.
+    Booking at price `p` and marking at the same `p` nets to zero for any `p`.
+    """
+    import canalyst.backtest as engine
+
+    close, sigma, rates, schedule = _world()
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule, ticker="S")
+
+    truth = run_backtest(CoveredCall(target_delta=0.25), **kw)
+    monkeypatch.setattr(engine, "_mark", _mutant_mark(variant))
+    corrupt = run_backtest(CoveredCall(target_delta=0.25), **kw)
+
+    # The whole point: the identity passes on a run that is priced wrong throughout.
+    assert corrupt.max_abs_residual < 1e-9, "the identity is blind to this"
+    truth.assert_identity()
+    corrupt.assert_identity()
+
+    # And every risk statistic has moved, which is the damage the identity cannot report.
+    truth_vol = truth.value.pct_change().std()
+    corrupt_vol = corrupt.value.pct_change().std()
+    assert not np.isclose(truth_vol, corrupt_vol, rtol=1e-3), (
+        f"volatility should differ: {truth_vol:.6f} vs {corrupt_vol:.6f}"
+    )
+
+
+def test_correct_marks_pass_the_lattice_check():
+    """The check must not fire on correct pricing, or it is noise."""
+    close, sigma, rates, schedule = _world()
+    result = run_backtest(
+        CoveredCall(target_delta=0.25), close, sigma, rates, schedule,
+        ticker="S", verify_marks=16,
+    )
+    result.assert_identity()
+    result.assert_marks()
+    assert len(result.mark_checks) > 5, "the sampler must actually sample something"
+    assert result.worst_mark_error < 0.01, result.worst_mark_error
+
+
+def test_mark_check_samples_only_interim_bars():
+    """Open and expiry bars are already pinned by the identity, so checking them proves
+    nothing about the marks in between."""
+    close, sigma, rates, schedule = _world()
+    result = run_backtest(
+        CoveredCall(target_delta=0.25), close, sigma, rates, schedule,
+        ticker="S", verify_marks=20,
+    )
+    assert result.mark_checks
+    for check in result.mark_checks:
+        assert check["years"] > 0.0, "an expiry bar carries no interim information"
+
+
+def test_mark_check_is_off_by_default():
+    """It costs roughly ten times a plain run, and a check that taxes every call gets
+    switched off. Every real analysis path enables it explicitly instead."""
+    close, sigma, rates, schedule = _world()
+    result = run_backtest(CoveredCall(target_delta=0.25), close, sigma, rates, schedule)
+    assert result.mark_checks == []
+    result.assert_marks()  # a no-op rather than a false pass
+    assert result.worst_mark_error == 0.0
+
+
+def test_lattice_check_also_catches_a_missing_dividend_yield(monkeypatch):
+    """It pins the mark LEVEL, so it catches any wrong pricing argument, not just time."""
+    import canalyst.backtest as engine
+    from canalyst.options.bs import bs_price
+
+    def ignores_q(kind, strike, spot, years, rate, sigma, quantity, div_yield=0.0):
+        return quantity * bs_price(spot, strike, years, rate, sigma, kind, q=0.0)
+
+    close, sigma, rates, schedule, dividends = _dividend_world(annual_yield=0.06)
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule,
+              dividends=dividends, ticker="S", verify_marks=16)
+
+    monkeypatch.setattr(engine, "_mark", ignores_q)
+    corrupt = run_backtest(CoveredCall(target_delta=0.25), **kw)
+    corrupt.assert_identity()
+    with pytest.raises(AssertionError, match="disagrees with an independent lattice"):
+        corrupt.assert_marks()
+
+
+def test_mark_check_does_not_false_positive_on_a_cheap_option():
+    """Materiality matters, or the check becomes noise people switch off.
+
+    Ordinary lattice discretisation error is a large FRACTION of a cheap out-of-the-money
+    premium while being economically irrelevant. Measured on real WMT data the protective put
+    reached 0.938% of premium against a 1% tolerance, on nothing but discretisation. A failure
+    now needs the error to be material against SPOT as well.
+    """
+    close, sigma, rates, schedule = _world(sigma_true=0.20)
+    result = run_backtest(
+        ProtectivePut(strike_rule="moneyness", otm_pct=0.15),  # cheap, far OTM
+        close, sigma, rates, schedule, ticker="S", verify_marks=20,
+    )
+    result.assert_identity()
+    result.assert_marks()
+    assert result.mark_checks
+    # Some checks may be a large fraction of premium, yet none material against spot.
+    assert max(c["spot_error"] for c in result.mark_checks) < 2e-4
+
+
+def test_mark_check_still_catches_a_material_error_on_a_cheap_option(monkeypatch):
+    """The materiality gate must not become a way of ignoring real errors."""
+    import canalyst.backtest as engine
+
+    close, sigma, rates, schedule = _world(sigma_true=0.20)
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule, ticker="S",
+              verify_marks=20)
+    monkeypatch.setattr(engine, "_mark", _mutant_mark("frozen"))
+    corrupt = run_backtest(CoveredCall(target_delta=0.25), **kw)
+    corrupt.assert_identity()
+    with pytest.raises(AssertionError, match="disagrees with an independent lattice"):
+        corrupt.assert_marks()

@@ -138,10 +138,12 @@ def main() -> int:
     common = dict(
         close=close, sigma=pricing_vol, rate=rf, schedule=schedule,
         dividends=dividends, ticker=ticker,
+        verify_marks=16,  # independent lattice check on sampled interim marks
     )
 
     benchmark = run_backtest(BuyHold(), **common)
     benchmark.assert_identity()
+    benchmark.assert_marks()
     bh_perf = summarise(benchmark.value, rf, label="buy and hold")
     bh_perf.verify()
     print()
@@ -157,11 +159,13 @@ def main() -> int:
 
     overlay = run_backtest(CoveredCall(target_delta=args.delta), **common)
     overlay.assert_identity()
+    overlay.assert_marks()
     cc_perf = summarise(overlay.value, rf, label=f"covered call {args.delta:.2f}d")
     cc_perf.verify()
 
     put = run_backtest(ProtectivePut(strike_rule="moneyness", otm_pct=0.05), **common)
     put.assert_identity()
+    put.assert_marks()
     put_perf = summarise(put.value, rf, label="protective put 5%")
     put_perf.verify()
 
@@ -172,6 +176,13 @@ def main() -> int:
           f"({overlay.net_premium / close.iloc[0]:.1%} of the opening share price)")
     print()
     print(put_perf.render())
+
+    print("\nindependent lattice check on sampled interim marks (worst relative error):")
+    for name, res in [
+        ("buy and hold", benchmark), ("covered call", overlay), ("protective put", put)
+    ]:
+        print(f"  {name:<16} {res.worst_mark_error:.3%}  "
+              f"({len(res.mark_checks)} bars sampled)")
 
     print("\naccounting identity, worst residual across every bar:")
     for name, res in [

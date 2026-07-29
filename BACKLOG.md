@@ -123,7 +123,7 @@ multiplies them.
 **Fix:** for each `(day, ratio)` in `history.splits`, assert
 `|log(close[day]/close[day-1])|` is NOT near `|log(1/ratio)|`.
 
-## 6. The invariant is telescoping, so interim mark errors are invisible to it
+## 6. The invariant is telescoping, so interim mark errors are invisible to it — FIXED 2026-07-29
 
 `backtest.py` marking loop.
 
@@ -136,8 +136,32 @@ assertions. An interim mark carrying **zero theta** failed 0 of 27 while moving 
 0.024 and vol by 1.3pp. Since `sweep` reports `sharpe_over_1` as a hard boolean and a
 measured BH Sharpe sat at 0.979, an error this size flips that bit.
 
-**Fix:** mark against `crosscheck.crr_price` on a sample of bars. This also catches any
-pricing-argument error, including item 1.
+**FIXED.** `run_backtest(verify_marks=N)` samples N interim bars and reprices every open
+position with a CRR lattice; `BacktestResult.assert_marks()` raises on disagreement. The
+lattice shares no arithmetic with the closed form, so it pins the mark LEVEL and also catches
+any wrong pricing argument, including a missing dividend yield (a named test covers that).
+
+Two design decisions worth keeping:
+
+- **Off by default.** Left on it made the suite roughly ten times slower (3.3s to 34.5s), and
+  a check that taxes every unrelated call is a check people switch off. Enabled explicitly in
+  `cli.py` and `scripts/fin642_run.py`, so every real analysis runs it while unit tests do not
+  pay for it.
+- **Failure needs BOTH a relative and a material error.** Relative-to-premium alone false-
+  positives: ordinary discretisation error is a large fraction of a cheap out-of-the-money
+  premium while being economically irrelevant. Measured on real WMT data the protective put hit
+  0.938% of premium against a 1% tolerance, on nothing but discretisation. A failure now also
+  requires 2bp of spot, which is far below anything that moves an equity curve and far below
+  the tens of percent a genuinely wrong mark produces.
+
+Scope note on the tests. Patching `_mark` corrupts the opening and settlement calls too, so
+terminal value moves in the reproduction, whereas the review's surgical interim-only mutants
+left it bit-identical. Reproducing that exactly would need a test-only seam in production code,
+a worse trade than stating the scope. The load-bearing claim is unaffected and is asserted: the
+residual stays at floating-point noise, so the identity certifies a run that is priced wrong.
+
+Measured on real WMT data: worst error 0.182% of premium on the covered call over 15 sampled
+bars, 0.938% on the protective put over 10, both immaterial against spot.
 
 ## 7. Smaller, all with concrete repros
 
