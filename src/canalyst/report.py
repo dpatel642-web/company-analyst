@@ -55,12 +55,16 @@ def plot_price_and_buy_hold(
     ax_growth.grid(alpha=0.25)
     ax_growth.legend(frameon=False)
 
+    # Anchor the label to the axes, not to the final data point: an offset from the last
+    # value lands on top of the line whenever the series ends mid-range.
     total = growth.iloc[-1] - 1.0
-    ax_growth.annotate(
-        f"buy and hold: {total:+.1%}",
-        xy=(growth.index[-1], growth.iloc[-1]),
-        xytext=(-140, 10), textcoords="offset points",
-        fontsize=10, color="#1f4e79",
+    ax_growth.text(
+        0.015, 0.93,
+        f"buy and hold over the window: {total:+.1%}",
+        transform=ax_growth.transAxes,
+        fontsize=10, color="#1f4e79", va="top",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85,
+                  edgecolor="#c8d6e5"),
     )
 
     fig.tight_layout()
