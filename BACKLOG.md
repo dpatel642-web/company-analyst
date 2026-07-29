@@ -211,9 +211,62 @@ What changed beyond the ticker:
   numbers, since the assembly and prose arithmetic are not.
 - Universals are gone. The real-IV limitation is stated as what was measured, not asserted.
 
-## Then: the batch build
+## Batch: RUN 2026-07-29, and the result reframes everything
 
-Agreed scope: union of all three watchlists (~35 equities), screened for optionability
+`scripts/watchlist_batch.py`, union of the three watchlists. 24 of 35 names usable, 19 with
+the full five-year window, 10 strategies each. Paired per-ticker against buy-and-hold on the
+same name over the same window, summarised by a sign test on the difference.
+
+**No strategy beat buy-and-hold on average. Every one had a negative mean Sharpe difference.**
+
+| strategy | beat on Sharpe | sign p | mean dSharpe | mean dReturn |
+|---|---|---|---|---|
+| protective put 5% | 7/19 | 0.359 | -0.039 | -60.7% |
+| covered call 0.25d | **9/19** | **1.000** | -0.043 | -75.4% |
+| bull call spread | 7/19 | 0.359 | -0.063 | -123.5% |
+| collar 5/5 | 9/19 | 1.000 | -0.065 | -120.6% |
+| wheel 0.25d | 7/19 | 0.359 | -0.073 | -112.0% |
+| zero-cost collar | 9/19 | 1.000 | -0.090 | -126.8% |
+| cash-secured put | 5/19 | 0.064 | -0.142 | -138.2% |
+| long straddle | 4/19 | 0.019 | -0.360 | -157.0% |
+| iron condor | 5/19 | 0.064 | -0.404 | -159.8% |
+| short strangle | 4/17 | 0.049 | -0.427 | -191.2% |
+
+Buy-and-hold's own mean Sharpe across those names: 0.414. The covered call beat its benchmark
+on Sharpe in exactly **9 of 19**, a literal coin flip.
+
+Three things this says, in order of importance.
+
+1. **WMT is a favourable case, not a general finding.** Its Sharpe 1.00 against 0.80 is one
+   cell out of 190. The graded writeup reports a 10-name cross-check at 4 of 10; this larger
+   run says the covered call is a coin flip on risk-adjusted return and a large loser on total
+   return across the watchlist. The writeup's claim is scoped to WMT and should stay there.
+2. **The ordering is exactly what a zero variance risk premium predicts.** The more premium a
+   structure sells, the worse it does: short strangle worst, then iron condor, then the
+   cash-secured put. The *long*-premium straddle also loses, because it pays for a spread that
+   does not exist either. Priced at realised vol every option trade is a fair bet, so all that
+   remains is the give-up, and on a watchlist full of high-growth names (NVDA, AMD, META,
+   MSTR, PANW, CRWD) capping the upside is expensive. The realised-vol limitation has stopped
+   being a caveat and become a measured result.
+3. **The straddle failing at p=0.019 is the control working.** A strategy set where nothing is
+   permitted to lose would be a broken strategy set.
+
+### The gate is now the binding problem
+
+11 of 35 names were screened out, and most were rejected for REAL price moves rather than data
+errors: BMNR +694.8%, AMC +95.2%, NWBO -58.2%, GME -33.8%, and NFLX for its genuine
+2022-04-20 subscriber crash. The outlier check has no warning tier, so a legitimately violent
+small cap cannot pass. This is round one's "hard failures with no override" item arriving as a
+concrete 31% coverage loss, and it is now the highest-value fix: an acknowledged-exceptions
+list or a warning tier, so a real move is disclosed rather than disqualifying the name.
+
+Cosmetic but misleading: the message reads "move(s) over 40%" then prints -35.1%. Both are
+correct (the threshold is on log returns, the display is simple) but the wording invites
+exactly the wrong conclusion.
+
+## Original batch scope, for reference
+
+Union of all three watchlists (~35 equities), screened for optionability
 with exclusions reported; VRP measured from real expired-contract option prices on a
 subset and used to calibrate the rest; and the strategies still to add are cash-secured
 put, bull call spread, long straddle, collar plus zero-cost collar, short strangle, iron
