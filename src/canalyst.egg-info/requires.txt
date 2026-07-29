@@ -1,9 +1,0 @@
-numpy
-pandas
-matplotlib
-yfinance
-exchange_calendars
-requests
-
-[dev]
-pytest
