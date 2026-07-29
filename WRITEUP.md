@@ -3,7 +3,8 @@
 Ticker: WMT. Window: 2021-07-29 to 2026-07-28, 1,254 trading sessions (5.00 calendar
 years). Code: [dpatel642-web/company-analyst](https://github.com/dpatel642-web/company-analyst),
 entry point [`scripts/fin642_run.py`](scripts/fin642_run.py). Reproduce with
-`make venv && make run`. 393 tests pass.
+`make venv && make run`. 419 tests pass. The cross-ticker batch is
+`scripts/watchlist_batch.py`.
 
 ## 1. The strategy, and why it should work
 
@@ -44,6 +45,10 @@ The covered call's Sharpe is **0.996**, against 0.80 for buy and hold. That roun
 and does not clear it, and I am reporting it as 0.996 rather than 1.0 because the difference
 between those two statements is the whole point of the assignment's target. It is a 24%
 improvement in risk-adjusted return on the same underlying.
+
+Read this number together with the cross-ticker batch in section 3. WMT is the best of 23
+names for this strategy, and across those 23 the strategy makes risk-adjusted return worse on
+average. This is a favourable case, not a general result.
 
 It clears 1.0 comfortably under any non-zero variance risk premium, which matters because
 of a modelling limitation described in section 4: options here are priced off realised
@@ -87,13 +92,43 @@ It won in 4 of 6 calendar years. 2024 is the cost of the strategy made visible: 
 and the overlay forfeited 16.6 points of that to the strikes, exactly as a covered call
 should. Excluding 2024, buy and hold returns +46.13% against the overlay's +62.42%.
 
-**Cross-ticker check.** The same pre-specified overlay was run over ten large caps, recorded
-as `SWEEP_UNIVERSE` in the script so this is reproducible rather than asserted: TSLA, KO,
-JNJ, WMT, COST, MSFT, AAPL, SPY, LLY, PG. It beat buy and hold on 4 of the 10 and produced
-the highest risk-adjusted return of any of them on WMT. On TSLA it lost badly, returning
--26.9% against +36.2%, because a 60%-volatility stock jumps past the strike repeatedly. That
-asymmetry is the strategy's real character, and a version of this that won everywhere would
-be a bug rather than a discovery.
+**Cross-ticker check, and it is the most important number in this writeup.** The same
+pre-specified overlay was run across every name on my watchlist with a full five-year history,
+23 of them, paired against buy and hold on the same ticker over the same window
+(`scripts/watchlist_batch.py`).
+
+**The covered call beat its own benchmark on risk-adjusted return in 9 of 23 names. That is a
+coin flip** (sign test p = 0.405), and its mean Sharpe difference across the 23 was **-0.062**,
+with a mean return difference of -61.6%. Nine other strategies were run alongside it and every
+single one also had a negative mean Sharpe difference. Ranked by how badly: short strangle
+-0.355, long straddle -0.331 (p = 0.011), iron condor -0.297, bull call spread -0.105,
+cash-secured put -0.093, zero-cost collar -0.089, the wheel -0.084, collar -0.075, covered call
+-0.062, protective put -0.039.
+
+So the honest reading of section 2 is this: **WMT is the single best cell in a universe where
+this strategy destroys risk-adjusted return on average.** It ranks 1st of 23 by covered-call
+Sharpe and 2nd by Sharpe improvement, behind AMZN. A result that good, selected from that many
+candidates, is a favourable case rather than evidence the strategy works.
+
+Two things in the batch make the mechanism concrete.
+
+**NVDA and MU both had buy-and-hold Sharpe above 1.0** (1.084 and 1.078), and the covered call
+*lowered* both (to 0.923 and 0.881) while cutting their returns from +905% to +401% and from
++992% to +373%. The two names that actually cleared this assignment's target did it by holding
+the stock and doing nothing. On TSLA the overlay returned -26.9% against +36.2%. A
+60%-volatility name jumps past the strike repeatedly, and every one of those jumps is forfeited.
+
+**The ordering across the ten strategies is exactly what a zero variance risk premium predicts,
+which points at this project's central limitation rather than at the strategies.** The more
+premium a structure sells, the worse it did. The long straddle, which *buys* premium, also lost,
+because it paid for a spread that does not exist either. Priced off realised volatility every
+option trade is a fair bet, so nothing is left but the give-up, and on a watchlist full of
+high-growth names capping the upside is expensive. Section 4 explains why realised volatility is
+the only basis available here.
+
+A version of this that won everywhere would be a bug rather than a discovery. What the batch
+shows is narrower and more useful than the WMT result on its own: the covered call is a way of
+converting return into stability on a name that grinds upward, not a way of making money.
 
 ## 4. Method, and the four things that would change the answer
 
