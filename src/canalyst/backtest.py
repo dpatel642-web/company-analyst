@@ -217,14 +217,23 @@ def run_backtest(
         # ---- 3. settle anything expiring today. Its mark is already intrinsic
         #         (years == 0), so crediting cash and dropping it is value-neutral.
         survivors: list[OpenPosition] = []
+        settled: list[OpenPosition] = []
         for pos in book:
             if pos.expiry <= day:
                 cash += pos.last_mark
+                settled.append(pos)
                 if abs(pos.last_mark) > 1e-12:
                     assignments += 1
             else:
                 survivors.append(pos)
         book = survivors
+
+        # Optional hook. A strategy with phases (the wheel) cannot otherwise tell "expired
+        # worthless" from "was assigned", because both leave an empty book. Passing the
+        # settled positions keeps the ledger the single source of truth rather than asking
+        # the strategy to track a parallel variable that can disagree with it.
+        if settled and hasattr(strategy, "note_expiry"):
+            strategy.note_expiry(spot, tuple(settled))
 
         # ---- 4. let the strategy act
         is_roll = day in expiry_by_roll

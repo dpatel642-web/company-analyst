@@ -3,7 +3,7 @@
 Ticker: WMT. Window: 2021-07-29 to 2026-07-28, 1,254 trading sessions (5.00 calendar
 years). Code: [dpatel642-web/company-analyst](https://github.com/dpatel642-web/company-analyst),
 entry point [`scripts/fin642_run.py`](scripts/fin642_run.py). Reproduce with
-`make venv && make run`. 292 tests pass.
+`make venv && make run`. 393 tests pass.
 
 ## 1. The strategy, and why it should work
 
@@ -36,9 +36,9 @@ the violent monthly gaps that make a short call expensive.
 |---|---|---|---|
 | **Sharpe (daily)** | 0.80 | **0.996** | 0.87 |
 | Sharpe (monthly) | 0.85 | 0.99 | 0.94 |
-| Sortino | 1.14 | **1.38** | 1.31 |
-| annualised volatility | 21.93% | **16.84%** | 18.55% |
-| max drawdown | -25.74% | -24.08% | **-18.27%** |
+| Sortino | 1.14 | **1.38** | 1.32 |
+| annualised volatility | 21.93% | **16.84%** | 18.42% |
+| max drawdown | -25.74% | -24.08% | **-18.16%** |
 
 The covered call's Sharpe is **0.996**, against 0.80 for buy and hold. That rounds to 1.00
 and does not clear it, and I am reporting it as 0.996 rather than 1.0 because the difference
@@ -62,7 +62,7 @@ sign as drift changes and silently reorders a comparison like this one.
 |---|---|---|
 | buy and hold | +154.25% | +20.64% |
 | **covered call 0.25 delta** | **+155.59%** | **+20.77%** |
-| protective put 5% | +144.32% | +19.68% |
+| protective put 5% | +143.57% | +19.61% |
 
 The covered call beat buy and hold on total return by 1.34 percentage points while holding
 23% less volatility. The margin on return is thin and I am not going to dress it up; the

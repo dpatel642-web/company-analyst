@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from ..options.bs import strike_from_delta
+from ..options.bs import bs_price, strike_from_delta
 from .base import BarContext, OptionSpec
 
 StrikeRule = Literal["delta", "moneyness"]
@@ -52,11 +52,42 @@ class ProtectivePut:
             return f"protective_put_delta_{self.target_delta:.2f}"
         return f"protective_put_otm_{self.otm_pct:.0%}"
 
+    def _strike_for(self, ctx: BarContext) -> float | None:
+        """The put strike this bar would use, or None if it cannot be determined."""
+        if ctx.expiry is None or ctx.years_to_expiry <= 0.0 or not ctx.sigma > 0.0:
+            return None
+        if self.strike_rule == "moneyness":
+            return round(ctx.spot * (1.0 - self.otm_pct), 2)
+        try:
+            return round(
+                strike_from_delta(
+                    ctx.spot, ctx.years_to_expiry, ctx.rate, ctx.sigma,
+                    self.target_delta, "put", q=ctx.div_yield,
+                ),
+                2,
+            )
+        except ValueError:
+            return None
+
     def target_shares(self, ctx: BarContext) -> float:
         if not self.fully_collateralised:
             return self.shares
         if not ctx.open_positions and ctx.spot > 0 and ctx.equity > 0:
-            self._shares_held = ctx.equity / ctx.spot
+            # Reserve the put's cost BEFORE sizing the share leg. Sweeping all of equity
+            # into stock and then buying protection finances the premium at the risk-free
+            # rate, which is a small levered tailwind for the one arm whose job is to be a
+            # sanity check. Measured before this fix: cash negative on 85% of bars.
+            # Solving `shares * (spot + premium_per_share) == equity` makes the stock and
+            # its insurance fit inside the capital together.
+            cost = 0.0
+            if ctx.is_roll:
+                strike = self._strike_for(ctx)
+                if strike is not None:
+                    cost = bs_price(
+                        ctx.spot, strike, ctx.years_to_expiry, ctx.rate, ctx.sigma,
+                        "put", q=ctx.div_yield,
+                    )
+            self._shares_held = ctx.equity / (ctx.spot + max(cost, 0.0))
         return self._shares_held
 
     def options_to_open(self, ctx: BarContext) -> list[OptionSpec]:
@@ -65,26 +96,9 @@ class ProtectivePut:
         if any(p.kind == "put" and p.quantity > 0 for p in ctx.open_positions):
             return []
 
-        # ctx.sigma is the pricing (implied) vol the engine also marks with.
-        sigma = ctx.sigma
-        if not sigma > 0.0:
+        strike = self._strike_for(ctx)
+        if strike is None:
             return []
-
-        if self.strike_rule == "moneyness":
-            strike = round(ctx.spot * (1.0 - self.otm_pct), 2)
-        else:
-            strike = round(
-                strike_from_delta(
-                    ctx.spot,
-                    ctx.years_to_expiry,
-                    ctx.rate,
-                    sigma,
-                    self.target_delta,
-                    "put",
-                    q=ctx.div_yield,
-                ),
-                2,
-            )
 
         return [
             OptionSpec(

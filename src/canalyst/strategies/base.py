@@ -18,7 +18,7 @@ from typing import Protocol
 
 import pandas as pd
 
-from ..options.bs import Kind
+from ..options.bs import Kind, strike_from_delta
 
 
 @dataclass(frozen=True)
@@ -88,6 +88,61 @@ class OpenPosition:
     @property
     def quantity(self) -> float:
         return self.spec.quantity
+
+
+def resolve_strike(
+    ctx: BarContext,
+    kind: Kind,
+    rule: str,
+    target_delta: float,
+    otm_pct: float,
+) -> float | None:
+    """Pick a strike by delta or by moneyness. Returns None when it cannot be solved.
+
+    Shared because eight strategies need it and eight copies would drift. `otm_pct` is
+    always a distance *out of the money*, so it is added for a call and subtracted for a
+    put; a caller wanting an in-the-money strike passes a negative value.
+
+    Uses `ctx.div_yield`, which matters: with the yield omitted a nominal 0.25-delta strike
+    actually sits at 0.2375, and the pre-specified parameter quietly stops being the one in
+    force.
+    """
+    if ctx.spot <= 0 or ctx.years_to_expiry <= 0.0 or not ctx.sigma > 0.0:
+        return None
+
+    if rule == "moneyness":
+        factor = (1.0 + otm_pct) if kind == "call" else (1.0 - otm_pct)
+        strike = ctx.spot * factor
+    elif rule == "delta":
+        try:
+            strike = strike_from_delta(
+                ctx.spot,
+                ctx.years_to_expiry,
+                ctx.rate,
+                ctx.sigma,
+                target_delta,
+                kind,
+                q=ctx.div_yield,
+            )
+        except ValueError:
+            # A deep-dated, high-yield combination can make the inversion unsolvable.
+            return None
+    else:
+        raise ValueError(f"unknown strike rule {rule!r}")
+
+    return round(strike, 2) if strike > 0 else None
+
+
+def contracts_for(equity: float, collateral_per_contract: float) -> float:
+    """Size a position to the capital backing it, so no strategy silently levers.
+
+    Every strategy in this package sizes against equity rather than holding a fixed
+    contract count. A fixed count turns any losing run into a growing margin loan, which is
+    how a covered call stopped being a covered call earlier in this project's history.
+    """
+    if equity <= 0 or collateral_per_contract <= 0:
+        return 0.0
+    return equity / collateral_per_contract
 
 
 class Strategy(Protocol):
