@@ -84,7 +84,7 @@ def test_age_hours_measures_from_fetch_time():
 
 def test_cache_round_trips_exactly(tmp_path):
     original = _synthetic()
-    _write_cache(tmp_path, original)
+    _write_cache(tmp_path, original, "2026-07-01", "2026-07-28")
     restored = _read_cache(tmp_path, "TEST", "stub")
 
     assert restored is not None
@@ -106,7 +106,7 @@ def test_cache_miss_returns_none(tmp_path):
 
 
 def test_corrupt_cache_returns_none_rather_than_raising(tmp_path):
-    _write_cache(tmp_path, _synthetic())
+    _write_cache(tmp_path, _synthetic(), "2026-07-01", "2026-07-28")
     (tmp_path / "TEST__stub.csv").write_text("not,a,valid\nframe")
     assert _read_cache(tmp_path, "TEST", "stub") is None
 
@@ -114,7 +114,7 @@ def test_corrupt_cache_returns_none_rather_than_raising(tmp_path):
 def test_cache_without_total_return_column_is_rejected(tmp_path):
     """An older cache layout must be treated as a miss, not silently half-loaded."""
     h = _synthetic()
-    _write_cache(tmp_path, h)
+    _write_cache(tmp_path, h, "2026-07-01", "2026-07-28")
     frame = pd.read_csv(tmp_path / "TEST__stub.csv", index_col="Date")
     frame.drop(columns=["TotalReturnClose"]).to_csv(
         tmp_path / "TEST__stub.csv", index_label="Date"
@@ -201,3 +201,55 @@ def test_loader_drops_an_unclosed_final_bar(tmp_path, monkeypatch):
         provider=StubProvider(with_today), cache_dir=tmp_path, drop_incomplete=True,
     )
     assert loaded.frame.index[-1] == pd.Timestamp("2026-07-28")
+
+
+# ------------------------------------------------- coverage: the bug that actually bit
+
+
+def test_cache_narrower_than_the_request_is_a_miss(tmp_path):
+    """A cache entry covering three months must NOT satisfy a five-year request.
+
+    This is the regression for a real failure. A PG entry written over H1 2024 as a test
+    fixture silently answered a five-year query with 64 bars, and the resulting Sharpe
+    looked perfectly reasonable. Silently short data is the failure mode this whole
+    project is built to refuse.
+    """
+    narrow = _synthetic(last="2024-06-28", n=124)
+    _write_cache(tmp_path, narrow, "2024-01-01", "2024-06-30")
+
+    # The same narrow window is still a legitimate hit.
+    assert _read_cache(tmp_path, "TEST", "stub",
+                       start="2024-02-01", end="2024-06-01") is not None
+    # A wider window is not.
+    assert _read_cache(tmp_path, "TEST", "stub",
+                       start="2021-07-29", end="2026-07-29") is None
+    # Overlapping but extending past either end is also not.
+    assert _read_cache(tmp_path, "TEST", "stub",
+                       start="2023-01-01", end="2024-06-30") is None
+    assert _read_cache(tmp_path, "TEST", "stub",
+                       start="2024-01-01", end="2025-01-01") is None
+
+
+def test_loader_refetches_when_the_cache_is_too_narrow(tmp_path):
+    provider = StubProvider(_synthetic(last="2026-07-28", n=400))
+    load_history("TEST", "2026-01-01", "2026-07-28",
+                 provider=provider, cache_dir=tmp_path, drop_incomplete=False)
+    assert provider.calls == 1
+    # Widening the request must go back to the provider, not reuse the narrow entry.
+    load_history("TEST", "2020-01-01", "2026-07-28",
+                 provider=provider, cache_dir=tmp_path, drop_incomplete=False)
+    assert provider.calls == 2
+
+
+def test_legacy_cache_without_coverage_metadata_is_a_miss(tmp_path):
+    """Entries written before coverage was tracked cannot be trusted to cover anything."""
+    import json
+    _write_cache(tmp_path, _synthetic(), "2026-07-01", "2026-07-28")
+    meta_path = tmp_path / "TEST__stub.json"
+    meta = json.loads(meta_path.read_text())
+    del meta["requested_start"], meta["requested_end"]
+    meta_path.write_text(json.dumps(meta))
+    assert _read_cache(tmp_path, "TEST", "stub",
+                       start="2026-07-01", end="2026-07-28") is None
+    # With no range asked for, it still loads: callers that do not care are not punished.
+    assert _read_cache(tmp_path, "TEST", "stub") is not None

@@ -108,7 +108,16 @@ def _cache_paths(cache_dir: Path, ticker: str, source: str) -> tuple[Path, Path]
     return cache_dir / f"{stem}.csv", cache_dir / f"{stem}.json"
 
 
-def _write_cache(cache_dir: Path, history: PriceHistory) -> None:
+def _write_cache(
+    cache_dir: Path, history: PriceHistory, requested_start, requested_end
+) -> None:
+    """Persist the frame plus the range that was *asked for*.
+
+    Recording the requested range, not merely the range returned, is what makes the
+    coverage check below possible. A ticker that listed mid-window legitimately returns
+    fewer bars than requested, so comparing against the data's own extent would make its
+    cache entry permanently invalid.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     csv_path, meta_path = _cache_paths(cache_dir, history.ticker, history.source)
     out = history.frame.copy()
@@ -123,13 +132,24 @@ def _write_cache(cache_dir: Path, history: PriceHistory) -> None:
                 "rows": int(len(out)),
                 "first": str(history.frame.index[0].date()),
                 "last": str(history.frame.index[-1].date()),
+                "requested_start": str(pd.Timestamp(requested_start).date()),
+                "requested_end": str(pd.Timestamp(requested_end).date()),
             },
             indent=2,
         )
     )
 
 
-def _read_cache(cache_dir: Path, ticker: str, source: str) -> PriceHistory | None:
+def _read_cache(
+    cache_dir: Path, ticker: str, source: str, start=None, end=None
+) -> PriceHistory | None:
+    """Load a cache entry, treating insufficient coverage as a miss.
+
+    Without the coverage check a narrow cached window silently satisfies a wider
+    request. That is not a performance problem, it is a correctness one: a five-year
+    Sharpe computed from three cached months looks entirely plausible. This bit once,
+    which is why the check exists.
+    """
     csv_path, meta_path = _cache_paths(cache_dir, ticker, source)
     if not (csv_path.exists() and meta_path.exists()):
         return None
@@ -140,6 +160,16 @@ def _read_cache(cache_dir: Path, ticker: str, source: str) -> PriceHistory | Non
         return None
     if "TotalReturnClose" not in frame.columns:
         return None
+
+    if start is not None or end is not None:
+        covered_start = meta.get("requested_start")
+        covered_end = meta.get("requested_end")
+        if covered_start is None or covered_end is None:
+            return None  # written before coverage was tracked
+        if start is not None and pd.Timestamp(covered_start) > pd.Timestamp(start):
+            return None
+        if end is not None and pd.Timestamp(covered_end) < pd.Timestamp(end):
+            return None
     total_return = frame.pop("TotalReturnClose")
     # Strip the index name the CSV round-trip introduces, so a cache hit is
     # indistinguishable from a fresh provider fetch rather than merely similar.
@@ -203,7 +233,7 @@ def load_history(
     cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE
 
     if use_cache:
-        cached = _read_cache(cache_dir, ticker, provider.name)
+        cached = _read_cache(cache_dir, ticker, provider.name, start=start, end=end)
         if cached is not None and cached.age_hours() <= ttl_hours:
             sliced = cached.slice(start, end)
             if len(sliced.frame) > 0:
@@ -216,5 +246,5 @@ def load_history(
             f"over {start}..{end}"
         )
     if use_cache:
-        _write_cache(cache_dir, fetched)
+        _write_cache(cache_dir, fetched, start, end)
     return drop_incomplete_bar(fetched) if drop_incomplete else fetched

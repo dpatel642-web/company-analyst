@@ -111,9 +111,8 @@ def run_backtest(
     rate: pd.Series,
     schedule: pd.DataFrame,
     dividends: pd.Series | None = None,
-    starting_cash: float = 0.0,
+    starting_equity: float | None = None,
     fee_per_contract: float = 0.0,
-    auto_fund: bool = True,
     ticker: str = "",
     settings: dict | None = None,
 ) -> BacktestResult:
@@ -136,11 +135,8 @@ def run_backtest(
     Per-share accounting throughout: one share of exposure, so the equity curve reads
     directly against buy-and-hold with no scaling factor.
 
-    `auto_fund` credits exactly enough cash on the first bar to pay for the opening
-    share position. Without it the purchase is debited from nothing, the curve starts at
-    zero instead of the share price, and every return is undefined on the first bar.
-    Funding it also gets the interest right: cash spent on the share stops earning, while
-    premium subsequently collected does earn.
+    `starting_equity` is the capital the portfolio begins with, defaulting to one share's
+    price so the curve starts level with buy-and-hold and returns are directly comparable.
     """
     index = pd.DatetimeIndex(close.index)
     if len(index) == 0:
@@ -158,7 +154,9 @@ def run_backtest(
     dt = 1.0 / TRADING_DAYS
 
     shares = 0.0
-    cash = float(starting_cash)
+    cash = (
+        float(starting_equity) if starting_equity is not None else float(close.iloc[0])
+    )
     book: list[OpenPosition] = []
 
     prev_value: float | None = None
@@ -218,6 +216,11 @@ def run_backtest(
             if expiry is not None and expiry in position_of_index
             else 0.0
         )
+        # Equity available to trade with right now: the share leg, cash, and whatever
+        # positions survived settlement. Strategies size against this so they cannot
+        # lever up on their own losses.
+        pre_trade_equity = shares * spot + cash + sum(p.last_mark for p in book)
+
         ctx = BarContext(
             date=day,
             spot=spot,
@@ -228,14 +231,11 @@ def run_backtest(
             expiry=expiry,
             years_to_expiry=years_to_expiry,
             open_positions=tuple(book),
+            equity=pre_trade_equity,
         )
 
         # share leg, traded at spot and therefore value-neutral
         target = float(strategy.target_shares(ctx))
-        if i == 0 and auto_fund:
-            # Credit the opening position's cost so the purchase nets to zero and the
-            # curve starts at the share price rather than at zero.
-            cash += target * spot
         if not math.isclose(target, shares, rel_tol=0.0, abs_tol=1e-12):
             cash -= (target - shares) * spot
             shares = target

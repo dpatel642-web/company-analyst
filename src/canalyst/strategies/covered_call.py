@@ -21,6 +21,23 @@ Two ways to pick the strike, both pre-specified rather than fitted:
              volatility, so the assignment probability is not stable.
   delta      strike at a fixed option delta. Holds the assignment probability roughly
              constant across volatility regimes, which is what a real overlay desk does.
+
+FULL COLLATERALISATION, and why it is not optional
+
+The obvious way to model this is "hold one share forever, and on assignment pay out
+(S_T - K) and keep the share". The handout does that, and it is wrong in a way that
+inverts the result.
+
+Each assignment debits cash without reducing the share position, so a run of losses
+leaves a full share of exposure financed by a growing margin loan. Measured on TSLA over
+five years, cash reached -240 against a share worth 222: exposure of 4.4x the remaining
+equity. Volatility then comes out *higher* than the underlying's, which is impossible for
+a genuine covered call, and the strategy is quietly being judged as a levered long.
+
+A real buy-write is collateralised: after a loss you own fewer shares, not the same share
+on credit. CBOE's BXM index works this way. So share count is reset to equity/spot at
+each roll, which caps exposure at 1.0x and can only ever deleverage. For buy-and-hold
+the same rule is a no-op, since equity/spot is identically one share.
 """
 
 from __future__ import annotations
@@ -41,6 +58,7 @@ class CoveredCall:
         otm_pct: float = 0.05,
         shares: float = 1.0,
         contracts: float = 1.0,
+        fully_collateralised: bool = True,
     ) -> None:
         if strike_rule not in ("delta", "moneyness"):
             raise ValueError(f"unknown strike_rule {strike_rule!r}")
@@ -59,6 +77,8 @@ class CoveredCall:
         self.otm_pct = float(otm_pct)
         self.shares = float(shares)
         self.contracts = float(contracts)
+        self.fully_collateralised = bool(fully_collateralised)
+        self._shares_held = float(shares)
 
     @property
     def name(self) -> str:
@@ -67,7 +87,16 @@ class CoveredCall:
         return f"covered_call_otm_{self.otm_pct:.0%}"
 
     def target_shares(self, ctx: BarContext) -> float:
-        return self.shares
+        if not self.fully_collateralised:
+            return self.shares
+        # Rebalance only when no option is open against the shares. While one is, the
+        # share count must stay fixed or the position stops being covered mid-cycle.
+        # Keying on "book is empty" rather than "is a roll date" also catches the final
+        # expiry, which has no successor roll and would otherwise be left unrebalanced
+        # carrying its settlement debit as a margin loan.
+        if not ctx.open_positions and ctx.spot > 0 and ctx.equity > 0:
+            self._shares_held = ctx.equity / ctx.spot
+        return self._shares_held
 
     def options_to_open(self, ctx: BarContext) -> list[OptionSpec]:
         if not ctx.is_roll or ctx.expiry is None or ctx.years_to_expiry <= 0.0:
@@ -96,11 +125,16 @@ class CoveredCall:
                 2,
             )
 
+        # Write against exactly the shares held, never more: that is what "covered" means.
+        contracts = self._shares_held if self.fully_collateralised else self.contracts
+        if contracts <= 0:
+            return []
+
         return [
             OptionSpec(
                 kind="call",
                 strike=strike,
                 expiry=ctx.expiry,
-                quantity=-self.contracts,  # short
+                quantity=-contracts,  # short
             )
         ]

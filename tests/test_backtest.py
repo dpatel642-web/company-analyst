@@ -119,7 +119,6 @@ def test_identity_holds_with_dividends_and_fees():
         close, sigma, rates, schedule,
         dividends=dividends,
         fee_per_contract=0.65,
-        starting_cash=25.0,
         ticker="SYNTH",
     )
     result.assert_identity()
@@ -174,7 +173,7 @@ def test_zero_vol_protective_put_also_collapses():
 def test_buy_hold_tracks_the_price_exactly():
     close, sigma, rates, schedule = _world()
     result = run_backtest(BuyHold(), close, sigma, rates, schedule, ticker="SYNTH")
-    # One share, no cash, no options: value IS the price.
+    # Funded with one share's price, holding one share, no options: value IS the price.
     pd.testing.assert_series_equal(
         result.value, close, check_names=False, rtol=0, atol=1e-9
     )
@@ -282,16 +281,16 @@ def test_pricing_vol_markup_increases_premium_collected():
 
 
 def test_interest_accrues_on_cash_and_matters():
+    """Extra starting equity leaves idle cash, which must earn the prevailing rate."""
     close, sigma, rates, schedule = _world(drift=0.0)
-    zero_rate = pd.Series(0.0, index=close.index)
-    high_rate = pd.Series(0.05, index=close.index)
+    idle = float(close.iloc[0]) * 3.0  # well above one share, so cash stays positive
     at_zero = run_backtest(
-        CoveredCall(target_delta=0.25), close, sigma, zero_rate, schedule,
-        starting_cash=100.0, ticker="S",
+        BuyHold(), close, sigma, pd.Series(0.0, index=close.index), schedule,
+        starting_equity=idle, ticker="S",
     )
     at_five = run_backtest(
-        CoveredCall(target_delta=0.25), close, sigma, high_rate, schedule,
-        starting_cash=100.0, ticker="S",
+        BuyHold(), close, sigma, pd.Series(0.05, index=close.index), schedule,
+        starting_equity=idle, ticker="S",
     )
     assert at_five.bars["interest"].sum() > at_zero.bars["interest"].sum()
     assert at_zero.bars["interest"].sum() == pytest.approx(0.0, abs=1e-12)
@@ -424,7 +423,7 @@ def test_strategy_cannot_see_the_future():
     for ctx in seen:
         assert set(vars(ctx)) == {
             "date", "spot", "sigma", "rate", "dividend",
-            "is_roll", "expiry", "years_to_expiry", "open_positions",
+            "is_roll", "expiry", "years_to_expiry", "open_positions", "equity",
         }
         if ctx.expiry is not None:
             assert ctx.expiry > ctx.date
@@ -461,8 +460,99 @@ def test_expiring_call_settles_at_intrinsic():
     )
     settled = result.bars.loc[expiry_day]
     assert settled["open_positions"] == 0
-    # Cash = premium received, minus the intrinsic paid away at 130 vs a 105 strike.
-    expected_cash = premium - (130.0 - strike)
-    interest = result.bars["interest"].cumsum().loc[expiry_day]
-    assert settled["cash"] == pytest.approx(expected_cash + interest, abs=1e-6)
     assert result.assignments == 1
+
+    # Check value, not cash. Once the book empties the strategy rebalances shares to
+    # equity/spot, which sweeps cash to zero and expresses the loss as a smaller
+    # position instead. Value is the quantity that has to be right either way:
+    #   one share at 130, plus the premium taken in, less the 130-against-105 intrinsic
+    #   paid away, plus interest earned on cash along the way.
+    interest = result.bars["interest"].cumsum().loc[expiry_day]
+    expected_value = 130.0 + premium - (130.0 - strike) + interest
+    assert settled["value"] == pytest.approx(expected_value, abs=1e-6)
+    assert settled["cash"] == pytest.approx(0.0, abs=1e-6)
+    assert settled["shares"] == pytest.approx(expected_value / 130.0, abs=1e-9)
+
+
+# ------------------------------------------- collateralisation: never lever on a loss
+
+# Note on what is measured here. share_value/equity is NOT a leverage metric for an
+# option position: a short call caps equity while the share notional keeps rising, so
+# that ratio exceeds 1 for any healthy covered call after a rally. Borrowing is what
+# matters, so the guard is on cash, on the covered condition, and on the volatility
+# property that the uncollateralised version actually violated.
+
+NEG_CASH_TOL = -1e-6
+
+
+@pytest.mark.parametrize("drift", [-0.45, 0.0, 0.60])
+@pytest.mark.parametrize("sigma_true", [0.35, 0.75])
+def test_covered_call_never_borrows(drift, sigma_true):
+    """Assignment losses must shrink the position, not open a margin loan.
+
+    Measured on real TSLA data, the fixed-one-share version drove cash to -240 against a
+    222 share, so 4.4x the remaining equity sat in stock funded by credit. Volatility then
+    printed 93.7% against the stock's 59.7%, which is impossible for a real covered call.
+    """
+    result = _run(CoveredCall(target_delta=0.25), drift=drift, sigma_true=sigma_true)
+    result.assert_identity()
+    assert result.bars["cash"].min() >= NEG_CASH_TOL
+
+
+def test_written_calls_are_always_covered_by_shares():
+    result = _run(CoveredCall(target_delta=0.25), drift=0.60, sigma_true=0.75)
+    live = result.bars[result.bars["open_positions"] > 0]
+    assert len(live) > 0
+    assert (live["shares"] > 0).all()
+
+
+def test_covered_call_deleverages_after_a_loss():
+    """The mechanism itself: shares must fall once assignments have eaten capital."""
+    result = _run(CoveredCall(target_delta=0.25), drift=0.60, sigma_true=0.75)
+    assert result.assignments > 0
+    assert result.bars["shares"].min() < 1.0
+
+
+@pytest.mark.parametrize("drift", [-0.45, 0.0, 0.60])
+def test_covered_call_volatility_stays_below_the_underlying(drift):
+    """Long stock plus a short call has net delta under one, so its volatility must be
+    under the underlying's. The uncollateralised version violated this on TSLA."""
+    close, sigma, rates, schedule = _world(drift=drift, sigma_true=0.65)
+    overlay = run_backtest(
+        CoveredCall(target_delta=0.25), close, sigma, rates, schedule, ticker="S"
+    )
+    benchmark = run_backtest(BuyHold(), close, sigma, rates, schedule, ticker="S")
+    assert overlay.value.pct_change().std() < benchmark.value.pct_change().std()
+
+
+def test_uncollateralised_mode_borrows_persistently():
+    """Keep the old behaviour reachable, and prove it is the thing that misbehaves.
+
+    The accounting was never wrong in either mode; only the economic model was.
+    """
+    kw = dict(drift=0.60, sigma_true=0.75)
+    good = _run(CoveredCall(target_delta=0.25), **kw)
+    bad = _run(CoveredCall(target_delta=0.25, fully_collateralised=False), **kw)
+    good.assert_identity()
+    bad.assert_identity()
+
+    bars = len(bad.bars)
+    borrowed = int((bad.bars["cash"] < NEG_CASH_TOL).sum())
+    assert borrowed > bars * 0.25, "the old model should borrow on many bars"
+    assert int((good.bars["cash"] < NEG_CASH_TOL).sum()) == 0
+    assert bad.bars["shares"].nunique() == 1, "the old model never deleverages"
+
+
+def test_collateralised_and_uncollateralised_agree_before_any_assignment():
+    """Until the first assignment there is nothing to deleverage, so they must match."""
+    close, sigma, rates, schedule = _world()
+    kw = dict(close=close, sigma=sigma, rate=rates, schedule=schedule, ticker="S")
+    on = run_backtest(CoveredCall(target_delta=0.25), **kw)
+    off = run_backtest(
+        CoveredCall(target_delta=0.25, fully_collateralised=False), **kw
+    )
+    first_roll = schedule.index[0]
+    upto = on.bars.index <= first_roll
+    pd.testing.assert_series_equal(
+        on.value[upto], off.value[upto], check_names=False, rtol=0, atol=1e-9
+    )

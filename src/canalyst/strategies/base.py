@@ -55,6 +55,9 @@ class BarContext:
     expiry: pd.Timestamp | None
     years_to_expiry: float
     open_positions: tuple["OpenPosition", ...]
+    #: Capital available right now, after marking and settling but before trading.
+    #: Strategies size against this so a losing run deleverages instead of borrowing.
+    equity: float = 0.0
 
 
 @dataclass(frozen=True)

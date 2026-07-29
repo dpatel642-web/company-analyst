@@ -28,6 +28,7 @@ class ProtectivePut:
         otm_pct: float = 0.05,
         shares: float = 1.0,
         contracts: float = 1.0,
+        fully_collateralised: bool = True,
     ) -> None:
         if strike_rule not in ("delta", "moneyness"):
             raise ValueError(f"unknown strike_rule {strike_rule!r}")
@@ -42,6 +43,8 @@ class ProtectivePut:
         self.otm_pct = float(otm_pct)
         self.shares = float(shares)
         self.contracts = float(contracts)
+        self.fully_collateralised = bool(fully_collateralised)
+        self._shares_held = float(shares)
 
     @property
     def name(self) -> str:
@@ -50,7 +53,11 @@ class ProtectivePut:
         return f"protective_put_otm_{self.otm_pct:.0%}"
 
     def target_shares(self, ctx: BarContext) -> float:
-        return self.shares
+        if not self.fully_collateralised:
+            return self.shares
+        if not ctx.open_positions and ctx.spot > 0 and ctx.equity > 0:
+            self._shares_held = ctx.equity / ctx.spot
+        return self._shares_held
 
     def options_to_open(self, ctx: BarContext) -> list[OptionSpec]:
         if not ctx.is_roll or ctx.expiry is None or ctx.years_to_expiry <= 0.0:
@@ -83,6 +90,8 @@ class ProtectivePut:
                 kind="put",
                 strike=strike,
                 expiry=ctx.expiry,
-                quantity=+self.contracts,  # long
+                quantity=+(
+                    self._shares_held if self.fully_collateralised else self.contracts
+                ),  # long
             )
         ]
