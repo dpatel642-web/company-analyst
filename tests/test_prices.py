@@ -29,7 +29,9 @@ class StubProvider:
         return self._history
 
 
-def _synthetic(last: str = "2026-07-28", n: int = 6) -> PriceHistory:
+def _synthetic(
+    last: str = "2026-07-28", n: int = 6, fetched_at: pd.Timestamp | None = None
+) -> PriceHistory:
     idx = pd.bdate_range(end=pd.Timestamp(last), periods=n)
     close = pd.Series(range(100, 100 + n), index=idx, dtype=float)
     frame = pd.DataFrame(
@@ -49,7 +51,7 @@ def _synthetic(last: str = "2026-07-28", n: int = 6) -> PriceHistory:
         frame=frame,
         total_return_close=close.rename("TotalReturnClose"),
         source="stub",
-        fetched_at=pd.Timestamp("2026-07-29T12:00:00"),
+        fetched_at=fetched_at if fetched_at is not None else pd.Timestamp("2026-07-29T12:00:00"),
     )
 
 
@@ -126,7 +128,9 @@ def test_cache_without_total_return_column_is_rejected(tmp_path):
 
 
 def test_loader_fetches_then_serves_from_cache(tmp_path):
-    provider = StubProvider(_synthetic())
+    # fetched_at must be "now": a fixed date ages past the 12h TTL a day after the
+    # test was written, and the second call then misses the cache by design.
+    provider = StubProvider(_synthetic(fetched_at=pd.Timestamp.now("UTC").tz_localize(None)))
     args = ("TEST", "2026-07-01", "2026-07-28")
     kwargs = dict(provider=provider, cache_dir=tmp_path, drop_incomplete=False)
 
